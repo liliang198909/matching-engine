@@ -1,0 +1,13 @@
+# Compiled binaries
+/demo
+/matching-engine
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
