@@ -11,11 +11,12 @@ Zero third-party dependencies — standard library only.
 - **Dual-index order book** — an ordered slice for O(1) best-price lookup, plus a hash map for O(1) price-level lookup
 - **Concurrency-safe** — all shared state is serialized through a mutex, verified under `go test -race`
 - **Market depth snapshot** — query the top *n* levels of both sides at any time
-- **Full test suite** — 18 unit tests covering matching, priority, book invariants, and concurrency
+- **HTTP API** — a thin `net/http` layer exposes submit / depth / trades as JSON, with request validation and typed error responses
+- **Full test suite** — 23 tests covering matching, priority, book invariants, concurrency, and the HTTP layer
 
 ## Quick Start
 
-Requires Go 1.21+ (uses the built-in `min` function).
+Requires Go 1.22+ (uses the built-in `min` function and method-based `ServeMux` patterns).
 
 ```bash
 git clone https://github.com/liliang198909/matching-engine.git
@@ -25,6 +26,7 @@ go test ./...        # run the test suite
 go test ./... -race  # verify concurrency safety
 
 go run ./cmd/demo    # run the interactive demo
+go run ./cmd/api     # start the HTTP server on :8080
 ```
 
 Demo output:
@@ -125,6 +127,59 @@ type Trade struct {
 }
 ```
 
+## HTTP API
+
+The `api` package is a thin protocol layer over `engine`: it decodes JSON, validates, calls the engine, and encodes the result back. `engine` itself has no knowledge of HTTP.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/orders` | Submit a limit order; returns the trades it generated |
+| `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
+| `GET` | `/trades` | Full trade history |
+| `GET` | `/healthz` | Liveness probe for load balancers / container checks |
+
+```bash
+# Rest a sell order — nothing crosses, so trades is empty
+curl -X POST localhost:8080/orders \
+  -d '{"side":"sell","price":100,"size":5}'
+# {"trades":[]}
+
+# Rest another sell order
+curl -X POST localhost:8080/orders \
+  -d '{"side":"sell","price":102,"size":3}'
+
+# Inspect the book
+curl 'localhost:8080/depth?n=5'
+# {"bids":[],"asks":[{"price":100,"volume":5},{"price":102,"volume":3}]}
+
+# A large buy order sweeps both levels
+curl -X POST localhost:8080/orders \
+  -d '{"side":"buy","price":102,"size":8}'
+# {"trades":[
+#   {"price":100,"size":5,"bid_order":3,"ask_order":1},
+#   {"price":102,"size":3,"bid_order":3,"ask_order":2}]}
+```
+
+Every rejection returns a JSON body with a single `error` field and an appropriate status code:
+
+```bash
+curl -X POST localhost:8080/orders -d '{"side":"hold","price":100,"size":1}'
+# {"error":"side must be \"buy\" or \"sell\""}   HTTP 400
+
+curl 'localhost:8080/depth?n=abc'
+# {"error":"n must be a positive integer"}       HTTP 400
+
+curl localhost:8080/orders
+# Method Not Allowed                             HTTP 405
+```
+
+Design choices worth noting:
+
+- **DTOs instead of direct serialization.** `engine.Trade` and `engine.PriceLevel` carry no `json` tags. Adding them would bind the domain model's field names to the wire protocol, so a later refactor of the engine would silently break API compatibility. The extra `tradeDTO` / `levelDTO` types keep the two layers independently evolvable.
+- **No locks in the API layer.** `Engine` already serializes every mutation behind a mutex, so handlers can call it from concurrent requests without extra coordination.
+- **No silent fallbacks on bad input.** `n=abc` returns 400 rather than quietly using the default. A client that sends garbage should learn about it immediately.
+- **`ReadHeaderTimeout` is set explicitly.** The zero-value `http.Server` has no timeouts, letting a slow-header connection hold a goroutine indefinitely.
+
 ## Design Notes
 
 **Why a slice *and* a map?**
@@ -153,6 +208,7 @@ A level that is fully consumed but left in the book would keep answering `BestBi
 | Both sides | sell orders crossing resting bids |
 | Snapshot | depth truncation, `Depth(0)`, volume positivity |
 | Concurrency | 100 goroutines submitting simultaneously, verified with `-race` |
+| HTTP layer | order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, 405 on wrong method |
 
 ```bash
 go test ./... -race
