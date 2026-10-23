@@ -4,6 +4,35 @@ A limit order book matching engine written in Go, implementing price-time priori
 
 Zero third-party dependencies — standard library only.
 
+## Live Demo
+
+A running instance is exposed over HTTPS:
+
+```
+https://09da9343f012e84b-39-148-102-232.serveousercontent.com
+```
+
+```bash
+BASE=https://09da9343f012e84b-39-148-102-232.serveousercontent.com
+
+curl $BASE/healthz
+# {"status":"ok"}
+
+curl -X POST $BASE/orders -d '{"side":"sell","price":100,"size":5}'
+# {"trades":[]}
+
+curl "$BASE/depth?n=5"
+# {"bids":[],"asks":[{"price":100,"volume":5}]}
+
+curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
+# {"trades":[{"price":100,"size":3,"bid_order":2,"ask_order":1}]}
+```
+
+> The demo URL is a temporary tunnel to a local process, so it is only reachable
+> while that process is running and the URL changes when it restarts. The
+> commands above are the full API surface — everything can equally be reproduced
+> locally with `go run ./cmd/api`.
+
 ## Features
 
 - **Price-time priority** — best price wins; at the same price, the earliest order fills first (FIFO)
