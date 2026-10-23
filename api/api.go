@@ -65,6 +65,9 @@ func (h *Handler) Routes() http.Handler {
 
 	// Go 1.22 起 ServeMux 支持「方法 + 路径」模式。
 	// 方法不匹配时标准库直接返回 405，省掉了手写 r.Method 判断的样板代码。
+	// "GET /{$}" 只匹配根路径本身；写成 "GET /" 会变成兜底路由，
+	// 把所有未知路径都吞掉，真正的 404 就再也看不到了。
+	mux.HandleFunc("GET /{$}", h.index)
 	mux.HandleFunc("POST /orders", h.submitOrder)
 	mux.HandleFunc("GET /orders/{id}", h.getOrder)
 	mux.HandleFunc("DELETE /orders/{id}", h.cancelOrder)
@@ -173,12 +176,43 @@ type tradesResponse struct {
 	Offset int        `json:"offset"`
 }
 
+// endpointDTO 描述一个可调用的端点。
+type endpointDTO struct {
+	Method  string `json:"method"`
+	Path    string `json:"path"`
+	Purpose string `json:"purpose"`
+}
+
+// indexResponse 是根路径的服务索引。
+//
+// 加这个接口纯粹为了可用性：把公网地址发给别人时，对方最自然的动作是
+// 直接在浏览器打开根路径，没有索引就会看到一句 404。
+type indexResponse struct {
+	Service   string        `json:"service"`
+	Endpoints []endpointDTO `json:"endpoints"`
+}
+
 // errorResponse 是统一的错误响应体，永远只有一个 error 字段。
 type errorResponse struct {
 	Error string `json:"error"`
 }
 
 // ---------------------------------------------------------------- handler
+
+// index 处理 GET /：返回服务名与全部端点，方便直接打开链接时看到用法。
+func (h *Handler) index(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, indexResponse{
+		Service: "matching-engine",
+		Endpoints: []endpointDTO{
+			{Method: "POST", Path: "/orders", Purpose: "Submit a limit order; returns the trades it generated"},
+			{Method: "GET", Path: "/orders/{id}", Purpose: "Order status: open / filled / cancelled"},
+			{Method: "DELETE", Path: "/orders/{id}", Purpose: "Cancel a resting order"},
+			{Method: "GET", Path: "/depth?n=5", Purpose: "Top-n market depth for both sides"},
+			{Method: "GET", Path: "/trades?limit=&offset=", Purpose: "Paginated trade history, oldest first"},
+			{Method: "GET", Path: "/healthz", Purpose: "Liveness probe"},
+		},
+	})
+}
 
 // submitOrder 处理 POST /orders：提交一笔限价单并返回撮合结果。
 //
@@ -374,9 +408,13 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	// 默认会把 &、<、> 转义成 \u0026 之类的形式（为嵌入 HTML 安全考虑）。
+	// 这是纯 JSON 接口，不嵌进 HTML，关掉转义后 URL 之类的字符串才保持可读。
+	enc.SetEscapeHTML(false)
 	// 响应已开始写出后无法再改状态码，编码失败也只能放弃，
 	// 因此这里显式忽略错误，而不是让错误静默消失。
-	_ = json.NewEncoder(w).Encode(payload)
+	_ = enc.Encode(payload)
 }
 
 // writeError 写出统一格式的错误响应。

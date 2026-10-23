@@ -396,6 +396,28 @@ func TestGetTradesRejectsInvalidPaging(t *testing.T) {
 	}
 }
 
+func TestIndexListsEndpoints(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	rec := do(t, h, http.MethodGet, "/", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var idx indexResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &idx); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if idx.Service != "matching-engine" || len(idx.Endpoints) != 6 {
+		t.Fatalf("index = %+v, want service and 6 endpoints", idx)
+	}
+
+	// 索引只挂根路径，不能变成兜底路由把未知路径也接住
+	if rec := do(t, h, http.MethodGet, "/nope", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown path: status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestGetOrderRejectsUnknownAndInvalidID(t *testing.T) {
 	h := NewHandler(engine.NewEngine(), nil).Routes()
 

@@ -12,6 +12,9 @@ A running instance is exposed over HTTPS:
 https://liliang-matching.serveousercontent.com
 ```
 
+The base URL itself returns a JSON index of every endpoint, so opening it in a
+browser shows what the service offers instead of a bare 404.
+
 ```bash
 BASE=https://liliang-matching.serveousercontent.com
 
@@ -58,7 +61,7 @@ the hostname is random and changes on every reconnect.
 - **HTTP API** — a thin `net/http` layer exposes submit / status / cancel / depth / trades as JSON, with request validation and typed error responses
 - **Paginated trade history** — `/trades?limit=&offset=` returns a window plus the total count, with a hard cap of 1000 per page so one request cannot copy the entire log
 - **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 40 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, and the HTTP layer
+- **Full test suite** — 41 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, and the HTTP layer
 
 ## Quick Start
 
@@ -221,6 +224,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 
 | Method | Path | Purpose |
 |--------|------|---------|
+| `GET` | `/` | Service index: name plus every endpoint below |
 | `POST` | `/orders` | Submit a limit order; returns the trades it generated |
 | `GET` | `/orders/{id}` | Order status: `open` / `filled` / `cancelled`, with filled and remaining size |
 | `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
@@ -381,7 +385,7 @@ A level that is fully consumed but left in the book would keep answering `BestBi
 | Both sides | sell orders crossing resting bids |
 | Snapshot | depth truncation, `Depth(0)`, volume positivity |
 | Concurrency | 100 goroutines submitting simultaneously, verified with `-race` |
-| HTTP layer | order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method |
+| HTTP layer | service index, order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method |
 
 ```bash
 go test ./... -race
