@@ -24,7 +24,8 @@ type Engine struct {
 	mu     sync.Mutex
 	book   *Orderbook
 	trades []Trade
-	seq    uint64 // 订单自增序号
+	seq    uint64            // 订单自增序号
+	index  map[uint64]*Order // 挂单索引：订单 ID → 订单，撤单时 O(1) 定位
 }
 
 // NewEngine 创建撮合引擎。
@@ -32,6 +33,7 @@ func NewEngine() *Engine {
 	return &Engine{
 		book:   NewOrderbook(),
 		trades: make([]Trade, 0),
+		index:  make(map[uint64]*Order),
 	}
 }
 
@@ -65,33 +67,80 @@ func (e *Engine) SubmitWithID(id uint64, size, price float64, bid bool) []Trade 
 	return e.submitLocked(id, size, price, bid)
 }
 
-// ReplayOrder 是回放历史订单所需的最小输入。
+// ReplayEvent 是回放日志中的一条事件：要么是下单，要么是撤单。
 //
-// 用引擎自己的结构体而不是直接接收数据库的行类型，
-// 是为了保持依赖方向：engine 不认识 store，store 也不用认识 engine。
-type ReplayOrder struct {
-	ID    uint64
-	Size  float64
-	Price float64
-	Bid   bool
+// 两种事件必须放在同一个有序序列里回放。如果先回放全部下单、再回放全部撤单，
+// 「撤单后又来了新订单」这种顺序会被打乱，撮合结果就与崩溃前不一致。
+type ReplayEvent struct {
+	OrderID uint64 // 下单事件：新订单 ID；撤单事件：被撤销的订单 ID
+	Size    float64
+	Price   float64
+	Bid     bool
+	Cancel  bool
 }
 
-// Replay 按给定顺序重新提交历史订单，重建订单簿与成交历史。
+// Replay 按给定顺序重新应用历史事件，重建订单簿与成交历史。
 //
 // 撮合过程是确定性的：订单的到达顺序、价格、数量一旦确定，
 // 每一笔成交的对手方和成交量也唯一确定。时间戳只影响同价位内的
-// 先后排序，而回放按 ID 递增提交，到达顺序本就一致。
+// 先后排序，而回放按日志顺序提交，到达顺序本就一致。
 // 因此回放结束后，内存状态与进程退出前完全等价。
-func (e *Engine) Replay(orders []ReplayOrder) {
+func (e *Engine) Replay(events []ReplayEvent) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	for _, o := range orders {
-		if o.ID > e.seq {
-			e.seq = o.ID
+	for _, ev := range events {
+		if ev.Cancel {
+			// 日志里可能有重复撤单，或者撤的是已被吃掉的订单，忽略即可
+			e.cancelLocked(ev.OrderID)
+			continue
 		}
-		e.submitLocked(o.ID, o.Size, o.Price, o.Bid)
+		if ev.OrderID > e.seq {
+			e.seq = ev.OrderID
+		}
+		e.submitLocked(ev.OrderID, ev.Size, ev.Price, ev.Bid)
 	}
+}
+
+// HasOrder 判断订单是否仍挂在订单簿上。
+//
+// 只用于写入撤单日志前做一次前置校验：对不存在的订单先返回 404，
+// 而不是先写一条无意义的日志再发现撤不掉。
+func (e *Engine) HasOrder(id uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	_, ok := e.index[id]
+	return ok
+}
+
+// CancelOrder 撤销一笔仍在订单簿上的订单，成功返回 true。
+//
+// 已完全成交的订单不在索引里，因此也会返回 false：
+// 交易所的撤单接口同样不会为已成交订单做任何事。
+func (e *Engine) CancelOrder(id uint64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.cancelLocked(id)
+}
+
+// cancelLocked 是 CancelOrder 与回放的共同实现。调用前必须已持有 e.mu。
+func (e *Engine) cancelLocked(id uint64) bool {
+	o, ok := e.index[id]
+	if !ok {
+		return false
+	}
+
+	limit := o.Limit
+	limit.DeleteOrder(o) // 同时扣减档位总量并断开 o 与档位的关系
+
+	// 撤单可能让整个档位变空，空档位必须从订单簿和索引中移除
+	if limit.IsEmpty() {
+		e.book.RemoveLimit(limit)
+	}
+	delete(e.index, id)
+	return true
 }
 
 // submitLocked 是 SubmitOrder 与 SubmitWithID 的共同实现。
@@ -109,6 +158,7 @@ func (e *Engine) submitLocked(id uint64, size, price float64, bid bool) []Trade 
 	// 仍有剩余则挂单，成为后续订单的对手盘
 	if !o.IsFilled() {
 		e.book.PlaceOrder(price, o)
+		e.index[o.ID] = o
 	}
 
 	e.trades = append(e.trades, filled...)
@@ -179,6 +229,9 @@ func (e *Engine) fill(o, counter *Order, price float64) (Trade, bool) {
 	exhausted := counter.IsFilled()
 	if exhausted {
 		counter.Limit.DeleteOrder(counter)
+		// 完全成交的订单不再可撤，必须从撤单索引里移除，
+		// 否则索引会一直持有已消失的订单，撤单也会误报成功。
+		delete(e.index, counter.ID)
 	}
 	return trade, exhausted
 }

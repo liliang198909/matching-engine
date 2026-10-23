@@ -255,12 +255,12 @@ func TestReplayRebuildsState(t *testing.T) {
 	wantTrades := orig.Trades()
 	wantBids, wantAsks := orig.Depth(5)
 
-	replay := []ReplayOrder{
-		{ID: 1, Size: 5, Price: 101, Bid: false},
-		{ID: 2, Size: 3, Price: 100, Bid: false},
-		{ID: 3, Size: 4, Price: 102, Bid: false},
-		{ID: 4, Size: 6, Price: 101, Bid: true},
-		{ID: 5, Size: 2, Price: 99, Bid: true},
+	replay := []ReplayEvent{
+		{OrderID: 1, Size: 5, Price: 101, Bid: false},
+		{OrderID: 2, Size: 3, Price: 100, Bid: false},
+		{OrderID: 3, Size: 4, Price: 102, Bid: false},
+		{OrderID: 4, Size: 6, Price: 101, Bid: true},
+		{OrderID: 5, Size: 2, Price: 99, Bid: true},
 	}
 
 	restored := NewEngine()
@@ -283,5 +283,101 @@ func TestReplayRebuildsState(t *testing.T) {
 	if trades[0].AskOrder != 6 || trades[0].BidOrder != 5 {
 		t.Errorf("新订单 ID = %d, 期望 6；对手方 = %d, 期望 5",
 			trades[0].AskOrder, trades[0].BidOrder)
+	}
+}
+
+func TestCancelRemovesOrderAndEmptyLevel(t *testing.T) {
+	e := NewEngine()
+
+	e.SubmitOrder(5, 100, false) // ID 1
+	e.SubmitOrder(3, 101, false) // ID 2
+
+	if !e.HasOrder(1) {
+		t.Fatal("订单 1 应在订单簿上")
+	}
+	if !e.CancelOrder(1) {
+		t.Fatal("撤单应成功")
+	}
+
+	// 100 档位只剩这一笔，撤掉后整个档位也应消失
+	bids, asks := e.Depth(5)
+	if len(bids) != 0 {
+		t.Errorf("买盘应为空，实际 %v", bids)
+	}
+	if len(asks) != 1 || asks[0].Price != 101 || asks[0].Volume != 3 {
+		t.Errorf("卖盘 = %v, 期望 [{101 3}]", asks)
+	}
+	if e.HasOrder(1) || e.CancelOrder(1) {
+		t.Error("已撤销的订单不应还能再次撤销")
+	}
+}
+
+func TestCancelKeepsFIFOOfRemainingOrders(t *testing.T) {
+	e := NewEngine()
+
+	e.SubmitOrder(2, 100, false) // ID 1
+	e.SubmitOrder(4, 100, false) // ID 2
+	e.SubmitOrder(3, 100, false) // ID 3
+
+	if !e.CancelOrder(2) {
+		t.Fatal("撤单应成功")
+	}
+
+	// 撤掉中间那笔后，剩余订单的先后顺序不能被破坏
+	trades := e.SubmitOrder(5, 100, true)
+	if len(trades) != 2 {
+		t.Fatalf("成交笔数 = %d, 期望 2", len(trades))
+	}
+	if trades[0].AskOrder != 1 || trades[0].Size != 2 {
+		t.Errorf("第一笔 = %+v, 期望先吃订单 1 的 2", trades[0])
+	}
+	if trades[1].AskOrder != 3 || trades[1].Size != 3 {
+		t.Errorf("第二笔 = %+v, 期望再吃订单 3 的 3", trades[1])
+	}
+}
+
+func TestCancelRejectsFilledOrder(t *testing.T) {
+	e := NewEngine()
+
+	e.SubmitOrder(5, 100, false) // ID 1
+	e.SubmitOrder(5, 100, true)  // ID 2，完全吃掉订单 1
+	if e.CancelOrder(1) || e.HasOrder(1) {
+		t.Error("已成交的订单不应还能撤销")
+	}
+	if e.CancelOrder(999) || e.HasOrder(999) {
+		t.Error("不存在的订单不应能撤销")
+	}
+}
+
+// TestReplayAppliesCancellationsInOrder 验证撤单与下单必须按日志原序回放。
+//
+// 若把所有撤单挪到最后统一处理，下面的买单会先吃到那笔被撤销的 100 卖单，
+// 成交结果与真实进程完全不同。
+func TestReplayAppliesCancellationsInOrder(t *testing.T) {
+	orig := NewEngine()
+
+	orig.SubmitOrder(5, 100, false) // ID 1，随后被撤
+	orig.SubmitOrder(3, 101, false) // ID 2
+	orig.CancelOrder(1)
+	orig.SubmitOrder(4, 101, true) // ID 3，只能吃到 101 档
+
+	wantTrades := orig.Trades()
+	wantBids, wantAsks := orig.Depth(5)
+
+	restored := NewEngine()
+	restored.Replay([]ReplayEvent{
+		{OrderID: 1, Size: 5, Price: 100},
+		{OrderID: 2, Size: 3, Price: 101},
+		{OrderID: 1, Cancel: true},
+		{OrderID: 3, Size: 4, Price: 101, Bid: true},
+	})
+
+	if got := restored.Trades(); !reflect.DeepEqual(got, wantTrades) {
+		t.Errorf("回放后成交历史 = %v, 期望 %v", got, wantTrades)
+	}
+	gotBids, gotAsks := restored.Depth(5)
+	if !reflect.DeepEqual(gotBids, wantBids) || !reflect.DeepEqual(gotAsks, wantAsks) {
+		t.Errorf("回放后盘口 = bids %v asks %v, 期望 bids %v asks %v",
+			gotBids, gotAsks, wantBids, wantAsks)
 	}
 }

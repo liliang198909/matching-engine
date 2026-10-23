@@ -85,29 +85,30 @@ func openStore(dsn string) *store.Postgres {
 	return pg
 }
 
-// restore 用历史订单回放重建订单簿与成交记录。
+// restore 用历史事件回放重建订单簿与成交记录。
 //
-// 这一步必须在开始接收请求之前完成，否则新订单会和历史订单乱序，
+// 这一步必须在开始接收请求之前完成，否则新订单会和历史事件乱序，
 // 撮合结果就不再与崩溃前一致。
 func restore(eng *engine.Engine, pg *store.Postgres) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	records, err := pg.LoadOrders(ctx)
+	records, err := pg.LoadEvents(ctx)
 	if err != nil {
-		log.Fatalf("load order log: %v", err)
+		log.Fatalf("load event log: %v", err)
 	}
 
-	replay := make([]engine.ReplayOrder, 0, len(records))
+	events := make([]engine.ReplayEvent, 0, len(records))
 	for _, r := range records {
-		replay = append(replay, engine.ReplayOrder{
-			ID:    r.ID,
-			Size:  r.Size,
-			Price: r.Price,
-			Bid:   r.Side == "buy",
+		events = append(events, engine.ReplayEvent{
+			OrderID: r.OrderID,
+			Size:    r.Size,
+			Price:   r.Price,
+			Bid:     r.Side == "buy",
+			Cancel:  r.Kind == "cancel",
 		})
 	}
-	eng.Replay(replay)
+	eng.Replay(events)
 
-	log.Printf("restored %d orders, rebuilt %d trades", len(replay), len(eng.Trades()))
+	log.Printf("restored %d events, rebuilt %d trades", len(events), len(eng.Trades()))
 }

@@ -26,10 +26,11 @@ const persistTimeout = 5 * time.Second
 // OrderStore 是接入层对持久化层的全部要求。
 //
 // 只声明用到的方法，而不是直接依赖 *store.Postgres：
-// 依赖的是能力（能追加一条订单日志），不是某个具体实现。
+// 依赖的是能力（能追加一条事件日志），不是某个具体实现。
 // 好处是测试里可以塞一个假实现，不必真的连数据库。
 type OrderStore interface {
 	InsertOrder(ctx context.Context, side string, price, size float64) (uint64, error)
+	InsertCancel(ctx context.Context, orderID uint64) error
 }
 
 // Handler 持有引擎实例，为每个 HTTP 请求提供入口。
@@ -56,6 +57,7 @@ func (h *Handler) Routes() http.Handler {
 	// Go 1.22 起 ServeMux 支持「方法 + 路径」模式。
 	// 方法不匹配时标准库直接返回 405，省掉了手写 r.Method 判断的样板代码。
 	mux.HandleFunc("POST /orders", h.submitOrder)
+	mux.HandleFunc("DELETE /orders/{id}", h.cancelOrder)
 	mux.HandleFunc("GET /depth", h.getDepth)
 	mux.HandleFunc("GET /trades", h.getTrades)
 	mux.HandleFunc("GET /healthz", h.health)
@@ -116,6 +118,12 @@ type tradeDTO struct {
 // 未成交时会返回空数组而不是 null，客户端可以无脑遍历。
 type orderResponse struct {
 	Trades []tradeDTO `json:"trades"`
+}
+
+// cancelResponse 是撤单成功的响应体。
+type cancelResponse struct {
+	OrderID   uint64 `json:"order_id"`
+	Cancelled bool   `json:"cancelled"`
 }
 
 // levelDTO 是盘口单个价格档位的对外表示。
@@ -192,6 +200,53 @@ func (h *Handler) submit(ctx context.Context, req orderRequest, bid bool) ([]eng
 		return nil, err
 	}
 	return h.engine.SubmitWithID(id, req.Size, req.Price, bid), nil
+}
+
+// cancelOrder 处理 DELETE /orders/{id}：撤销一笔仍挂在订单簿上的订单。
+//
+// {id} 是 Go 1.22 起 ServeMux 支持的路径通配符，取值用 r.PathValue 读取。
+func (h *Handler) cancelOrder(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		return
+	}
+
+	// 先确认订单真的还挂着，再写撤单日志。
+	// 对已成交或不存在的订单，交易所的撤单接口同样不会做任何事。
+	if !h.engine.HasOrder(id) {
+		writeError(w, http.StatusNotFound, "order not found or already filled")
+		return
+	}
+
+	if err := h.cancel(r.Context(), id); err != nil {
+		// 与下单同理：日志写不进去就绝不改内存状态，
+		// 否则重启回放时这笔撤单会凭空消失，订单又活过来。
+		log.Printf("persist cancellation: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "could not persist cancellation")
+		return
+	}
+
+	// 前面校验过，但这里仍可能失败：两个撤单请求并发时，
+	// 另一个可能已经把订单撤掉了。
+	if !h.engine.CancelOrder(id) {
+		writeError(w, http.StatusNotFound, "order not found or already filled")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, cancelResponse{OrderID: id, Cancelled: true})
+}
+
+// cancel 把撤单写进事件日志。未配置持久化时直接返回 nil。
+func (h *Handler) cancel(ctx context.Context, id uint64) error {
+	if h.orders == nil {
+		return nil
+	}
+
+	ctx, done := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	defer done()
+
+	return h.orders.InsertCancel(ctx, id)
 }
 
 // getDepth 处理 GET /depth?n=5：返回盘口前 n 档。

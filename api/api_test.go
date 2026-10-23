@@ -125,9 +125,11 @@ func TestMethodNotAllowed(t *testing.T) {
 // 接入层只依赖 OrderStore 这一条方法，所以不必真连 Postgres
 // 也能验证「先拿 ID、再撮合」这个顺序是否被遵守。
 type fakeStore struct {
-	nextID   uint64
-	inserted int
-	err      error
+	nextID    uint64
+	inserted  int
+	cancels   []uint64
+	err       error
+	cancelErr error
 }
 
 func (f *fakeStore) InsertOrder(_ context.Context, _ string, _, _ float64) (uint64, error) {
@@ -137,6 +139,14 @@ func (f *fakeStore) InsertOrder(_ context.Context, _ string, _, _ float64) (uint
 	f.nextID++
 	f.inserted++
 	return f.nextID, nil
+}
+
+func (f *fakeStore) InsertCancel(_ context.Context, orderID uint64) error {
+	if f.cancelErr != nil {
+		return f.cancelErr
+	}
+	f.cancels = append(f.cancels, orderID)
+	return nil
 }
 
 func TestSubmitOrderUsesStoreAssignedID(t *testing.T) {
@@ -180,5 +190,85 @@ func TestSubmitOrderRejectsWhenStoreFails(t *testing.T) {
 	}
 	if len(depth.Bids) != 0 || len(depth.Asks) != 0 {
 		t.Fatalf("engine mutated after failed persist: bids=%v asks=%v", depth.Bids, depth.Asks)
+	}
+}
+
+func TestCancelOrder(t *testing.T) {
+	store := &fakeStore{nextID: 41} // 下一笔订单拿到 ID 42
+	h := NewHandler(engine.NewEngine(), store).Routes()
+
+	do(t, h, http.MethodPost, "/orders", `{"side":"sell","price":100,"size":5}`)
+
+	rec := do(t, h, http.MethodDelete, "/orders/42", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp cancelResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.OrderID != 42 || !resp.Cancelled {
+		t.Fatalf("response = %+v, want order 42 cancelled", resp)
+	}
+
+	// 撤单日志必须写进事件表，否则重启回放时这笔订单会复活
+	if len(store.cancels) != 1 || store.cancels[0] != 42 {
+		t.Fatalf("persisted cancels = %v, want [42]", store.cancels)
+	}
+
+	// 唯一一笔挂单被撤，盘口应当清空
+	depthRec := do(t, h, http.MethodGet, "/depth", "")
+	var depth depthResponse
+	if err := json.Unmarshal(depthRec.Body.Bytes(), &depth); err != nil {
+		t.Fatalf("decode depth: %v", err)
+	}
+	if len(depth.Bids) != 0 || len(depth.Asks) != 0 {
+		t.Fatalf("depth not empty after cancel: bids=%v asks=%v", depth.Bids, depth.Asks)
+	}
+}
+
+func TestCancelUnknownOrder(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	for _, id := range []string{"1", "999"} {
+		rec := do(t, h, http.MethodDelete, "/orders/"+id, "")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("id %s: status = %d, want %d", id, rec.Code, http.StatusNotFound)
+		}
+	}
+}
+
+func TestCancelRejectsInvalidID(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	for _, id := range []string{"abc", "0", "-1"} {
+		rec := do(t, h, http.MethodDelete, "/orders/"+id, "")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("id %s: status = %d, want %d", id, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+func TestCancelKeepsOrderWhenStoreFails(t *testing.T) {
+	store := &fakeStore{nextID: 41}
+	h := NewHandler(engine.NewEngine(), store).Routes()
+
+	do(t, h, http.MethodPost, "/orders", `{"side":"sell","price":100,"size":5}`)
+	store.cancelErr = errors.New("connection refused")
+
+	rec := do(t, h, http.MethodDelete, "/orders/42", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	// 日志没写成，内存里的挂单就不能消失
+	depthRec := do(t, h, http.MethodGet, "/depth", "")
+	var depth depthResponse
+	if err := json.Unmarshal(depthRec.Body.Bytes(), &depth); err != nil {
+		t.Fatalf("decode depth: %v", err)
+	}
+	if len(depth.Asks) != 1 || depth.Asks[0].Price != 100 {
+		t.Fatalf("order vanished after failed cancel: asks=%v", depth.Asks)
 	}
 }

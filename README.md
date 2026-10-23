@@ -40,9 +40,10 @@ curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
 - **Dual-index order book** — an ordered slice for O(1) best-price lookup, plus a hash map for O(1) price-level lookup
 - **Concurrency-safe** — all shared state is serialized through a mutex, verified under `go test -race`
 - **Market depth snapshot** — query the top *n* levels of both sides at any time
-- **HTTP API** — a thin `net/http` layer exposes submit / depth / trades as JSON, with request validation and typed error responses
-- **Durable** — every order is appended to a PostgreSQL order log before it is matched; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 26 tests covering matching, priority, book invariants, concurrency, recovery, and the HTTP layer
+- **Order cancellation** — cancel a resting order by ID in O(1) via an ID index; emptied price levels are removed
+- **HTTP API** — a thin `net/http` layer exposes submit / cancel / depth / trades as JSON, with request validation and typed error responses
+- **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
+- **Full test suite** — 34 tests covering matching, priority, cancellation, book invariants, concurrency, recovery, and the HTTP layer
 
 ## Quick Start
 
@@ -177,6 +178,9 @@ trades := e.SubmitOrder(size, price, bid) // bid=true → buy, false → sell
 // Top-n market depth snapshot for both sides.
 bids, asks := e.Depth(5)
 
+// Cancel a resting order by ID. Returns false if it is unknown or already filled.
+cancelled := e.CancelOrder(42)
+
 // Full trade history (copy).
 all := e.Trades()
 ```
@@ -197,6 +201,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/orders` | Submit a limit order; returns the trades it generated |
+| `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
 | `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
 | `GET` | `/trades` | Full trade history |
 | `GET` | `/healthz` | Liveness probe for load balancers / container checks |
@@ -223,6 +228,19 @@ curl -X POST localhost:8080/orders \
 #   {"price":102,"size":3,"bid_order":3,"ask_order":2}]}
 ```
 
+Cancelling a resting order removes it from the book, and its price level disappears once the last order at that price is gone:
+
+```bash
+curl -X POST localhost:8080/orders -d '{"side":"sell","price":100,"size":5}'
+# order 4 rests
+
+curl -X DELETE localhost:8080/orders/4
+# {"order_id":4,"cancelled":true}
+
+curl -X DELETE localhost:8080/orders/4
+# {"error":"order not found or already filled"}   HTTP 404
+```
+
 Every rejection returns a JSON body with a single `error` field and an appropriate status code:
 
 ```bash
@@ -245,38 +263,42 @@ Design choices worth noting:
 
 ## Persistence
 
-Orders are appended to PostgreSQL *before* they are matched. That order log is the only source of truth — trades are not stored in a separate table.
+Every event — an order placed or an order cancelled — is appended to PostgreSQL *before* it is applied to the book. That event log is the only source of truth; trades are not stored separately.
 
 ```sql
-CREATE TABLE orders (
+CREATE TABLE events (
     id         BIGSERIAL PRIMARY KEY,
-    side       TEXT             NOT NULL CHECK (side IN ('buy', 'sell')),
-    price      DOUBLE PRECISION NOT NULL CHECK (price > 0),
-    size       DOUBLE PRECISION NOT NULL CHECK (size > 0),
+    kind       TEXT             NOT NULL CHECK (kind IN ('order', 'cancel')),
+    side       TEXT             CHECK (side IN ('buy', 'sell')), -- order events only
+    price      DOUBLE PRECISION CHECK (price > 0),               -- order events only
+    size       DOUBLE PRECISION CHECK (size > 0),                -- order events only
+    cancel_id  BIGINT,                                           -- cancel events only
     created_at TIMESTAMPTZ      NOT NULL DEFAULT now()
 );
 ```
 
-```
-POST /orders
-   │
-   ├─ INSERT ... RETURNING id ──► PostgreSQL order log
-   │        │
-   │        └─ id comes from the sequence, not from memory
-   ▼
-engine.SubmitWithID(id, size, price, bid) ──► in-memory book + trades
-```
-
-On startup the service replays the log in ID order through the same matching code that serves live traffic:
+Both kinds share one sequence on purpose. Two separate tables would lose the true interleaving — order, cancel, order — and replay would then produce trades that never happened.
 
 ```
-orders (id asc) ──► Replay ──► Orderbook + Trades
+POST /orders                  DELETE /orders/{id}
+    │                                  │
+    ├─ INSERT order ────┬──────────────┴─ INSERT cancel
+    │        │          │                    │
+    │        └ id from sequence              └ cancel_id
+    ▼                                        ▼
+engine.SubmitWithID(...)             engine.CancelOrder(...)
+```
+
+On startup the log is replayed in event order through the same engine calls that serve live traffic:
+
+```
+events (id asc) ──► Replay ──► Orderbook + Trades
 ```
 
 Why replay instead of a second trades table:
 
-- **One source of truth.** Two tables can disagree, and a half-written pair is the kind of bug you find days later. Matching is deterministic, so the trade list is a pure function of the order log.
-- **Crash consistency.** A `201` means the order is already durable. If the process dies after the insert but before matching, the next start matches it — no lost or duplicated fills.
+- **One source of truth.** Two tables can disagree, and a half-written pair is the kind of bug you find days later. Matching is deterministic, so the trade list is a pure function of the event log.
+- **Crash consistency.** A `201` means the order is already durable, and a cancelled order stays cancelled across restarts. If the process dies after the insert but before matching, the next start applies it — no lost, duplicated, or resurrected orders.
 - **ID continuity.** The database sequence assigns order IDs, so they keep increasing across restarts instead of resetting to 1 and colliding with history.
 
 Known limits, stated on purpose: startup replay is O(n) and fine only while the log is small; prices are `DOUBLE PRECISION` because the engine is `float64` (a production exchange would use fixed-point); and a single API replica owns the book, since matching is in-memory.
