@@ -380,4 +380,52 @@ func TestReplayAppliesCancellationsInOrder(t *testing.T) {
 		t.Errorf("回放后盘口 = bids %v asks %v, 期望 bids %v asks %v",
 			gotBids, gotAsks, wantBids, wantAsks)
 	}
+
+	// 已撤销订单的状态也必须能查出来，而不是被当成不存在
+	if st, ok := restored.Status(1); !ok || st.State != StateCancelled {
+		t.Errorf("订单 1 状态 = %+v ok=%v, 期望 cancelled", st, ok)
+	}
+	if st, ok := restored.Status(3); !ok || st.State != StateOpen || st.Remaining != 1 {
+		t.Errorf("订单 3 状态 = %+v ok=%v, 期望 open 且剩余 1", st, ok)
+	}
+}
+
+// TestOrderStatusLifecycle 覆盖 open → 部分成交 → 撤单、以及完全成交两条路径。
+func TestOrderStatusLifecycle(t *testing.T) {
+	e := NewEngine()
+
+	e.SubmitOrder(5, 100, false) // ID 1，卖 5 @ 100
+
+	st, ok := e.Status(1)
+	if !ok {
+		t.Fatal("订单 1 应可查询")
+	}
+	if st.State != StateOpen || st.Size != 5 || st.Filled != 0 || st.Remaining != 5 {
+		t.Errorf("新订单状态 = %+v, 期望 open 且全部未成交", st)
+	}
+	if st.Price != 100 || st.Bid {
+		t.Errorf("订单价格/方向 = %v/%v, 期望 100 卖单", st.Price, st.Bid)
+	}
+
+	e.SubmitOrder(3, 100, true) // ID 2，成交 3
+
+	// 被动方订单部分成交：数量减少，但状态仍是 open
+	if st, _ := e.Status(1); st.Filled != 3 || st.Remaining != 2 || st.State != StateOpen {
+		t.Errorf("部分成交后订单 1 = %+v, 期望 filled=3 remaining=2 open", st)
+	}
+	// 主动方订单被完全吃掉
+	if st, _ := e.Status(2); st.State != StateFilled || st.Filled != 3 || st.Remaining != 0 {
+		t.Errorf("完全成交后订单 2 = %+v, 期望 filled", st)
+	}
+
+	e.CancelOrder(1)
+
+	// 撤单只撤剩余量，已成交部分保留在记录里
+	if st, _ := e.Status(1); st.State != StateCancelled || st.Remaining != 0 || st.Filled != 3 {
+		t.Errorf("撤单后订单 1 = %+v, 期望 cancelled 且 filled=3", st)
+	}
+
+	if _, ok := e.Status(999); ok {
+		t.Error("不存在的订单不应可查询")
+	}
 }

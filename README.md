@@ -9,11 +9,11 @@ Standard library for everything except the PostgreSQL driver (`pgx`).
 A running instance is exposed over HTTPS:
 
 ```
-https://85a5387dfec8bd3a-39-148-102-232.serveousercontent.com
+https://4814f94a7b78918a-39-148-102-232.serveousercontent.com
 ```
 
 ```bash
-BASE=https://85a5387dfec8bd3a-39-148-102-232.serveousercontent.com
+BASE=https://4814f94a7b78918a-39-148-102-232.serveousercontent.com
 
 curl $BASE/healthz
 # {"status":"ok"}
@@ -41,9 +41,10 @@ curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
 - **Concurrency-safe** — all shared state is serialized through a mutex, verified under `go test -race`
 - **Market depth snapshot** — query the top *n* levels of both sides at any time
 - **Order cancellation** — cancel a resting order by ID in O(1) via an ID index; emptied price levels are removed
-- **HTTP API** — a thin `net/http` layer exposes submit / cancel / depth / trades as JSON, with request validation and typed error responses
+- **Order lifecycle queries** — completed and cancelled orders remain queryable, with `open` / `filled` / `cancelled` state plus filled and remaining size
+- **HTTP API** — a thin `net/http` layer exposes submit / status / cancel / depth / trades as JSON, with request validation and typed error responses
 - **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 34 tests covering matching, priority, cancellation, book invariants, concurrency, recovery, and the HTTP layer
+- **Full test suite** — 37 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, and the HTTP layer
 
 ## Quick Start
 
@@ -181,6 +182,9 @@ bids, asks := e.Depth(5)
 // Cancel a resting order by ID. Returns false if it is unknown or already filled.
 cancelled := e.CancelOrder(42)
 
+// Order lifecycle status, including orders that already left the book.
+status, ok := e.Status(42) // ok=false if the order never existed
+
 // Full trade history (copy).
 all := e.Trades()
 ```
@@ -201,6 +205,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/orders` | Submit a limit order; returns the trades it generated |
+| `GET` | `/orders/{id}` | Order status: `open` / `filled` / `cancelled`, with filled and remaining size |
 | `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
 | `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
 | `GET` | `/trades` | Full trade history |
@@ -239,6 +244,20 @@ curl -X DELETE localhost:8080/orders/4
 
 curl -X DELETE localhost:8080/orders/4
 # {"error":"order not found or already filled"}   HTTP 404
+```
+
+Every order stays queryable after it leaves the book, so a client can poll for the final outcome:
+
+```bash
+curl -X POST localhost:8080/orders -d '{"side":"sell","price":100,"size":5}'  # order 4
+curl -X POST localhost:8080/orders -d '{"side":"buy","price":100,"size":2}'   # order 5
+
+curl localhost:8080/orders/4
+# {"order_id":4,"side":"sell","price":100,"size":5,"filled":2,"remaining":3,"state":"open"}
+
+curl -X DELETE localhost:8080/orders/4
+curl localhost:8080/orders/4
+# {"order_id":4,"side":"sell","price":100,"size":5,"filled":2,"remaining":0,"state":"cancelled"}
 ```
 
 Every rejection returns a JSON body with a single `error` field and an appropriate status code:
@@ -301,7 +320,7 @@ Why replay instead of a second trades table:
 - **Crash consistency.** A `201` means the order is already durable, and a cancelled order stays cancelled across restarts. If the process dies after the insert but before matching, the next start applies it — no lost, duplicated, or resurrected orders.
 - **ID continuity.** The database sequence assigns order IDs, so they keep increasing across restarts instead of resetting to 1 and colliding with history.
 
-Known limits, stated on purpose: startup replay is O(n) and fine only while the log is small; prices are `DOUBLE PRECISION` because the engine is `float64` (a production exchange would use fixed-point); and a single API replica owns the book, since matching is in-memory.
+Known limits, stated on purpose: startup replay is O(n) and fine only while the log is small; the trade history and order-status map live in memory and grow with the log (a real deployment would page them from PostgreSQL); prices are `DOUBLE PRECISION` because the engine is `float64` (a production exchange would use fixed-point); and a single API replica owns the book, since matching is in-memory.
 
 ## Design Notes
 

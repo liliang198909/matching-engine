@@ -6,6 +6,7 @@ import "time"
 type Order struct {
 	ID        uint64  // 订单唯一标识
 	Size      float64 // 剩余未成交数量
+	Price     float64 // 委托限价，整个生命周期内不变
 	Bid       bool    // true 为买单，false 为卖单
 	Timestamp int64   // 下单时间（Unix 纳秒），用于同价位的时间优先排序
 	Limit     *Limit  // 所属价格档位；完全成交或撤单后置为 nil

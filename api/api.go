@@ -57,6 +57,7 @@ func (h *Handler) Routes() http.Handler {
 	// Go 1.22 起 ServeMux 支持「方法 + 路径」模式。
 	// 方法不匹配时标准库直接返回 405，省掉了手写 r.Method 判断的样板代码。
 	mux.HandleFunc("POST /orders", h.submitOrder)
+	mux.HandleFunc("GET /orders/{id}", h.getOrder)
 	mux.HandleFunc("DELETE /orders/{id}", h.cancelOrder)
 	mux.HandleFunc("GET /depth", h.getDepth)
 	mux.HandleFunc("GET /trades", h.getTrades)
@@ -124,6 +125,20 @@ type orderResponse struct {
 type cancelResponse struct {
 	OrderID   uint64 `json:"order_id"`
 	Cancelled bool   `json:"cancelled"`
+}
+
+// orderStatusDTO 是查单接口的响应体。
+//
+// 同样不直接序列化 engine.OrderStatus：领域类型的字段名一旦绑上 json tag，
+// 引擎重构就会变成接口变更。
+type orderStatusDTO struct {
+	OrderID   uint64  `json:"order_id"`
+	Side      string  `json:"side"`
+	Price     float64 `json:"price"`
+	Size      float64 `json:"size"`      // 下单数量
+	Filled    float64 `json:"filled"`    // 已成交数量
+	Remaining float64 `json:"remaining"` // 剩余数量
+	State     string  `json:"state"`     // open / filled / cancelled
 }
 
 // levelDTO 是盘口单个价格档位的对外表示。
@@ -200,6 +215,39 @@ func (h *Handler) submit(ctx context.Context, req orderRequest, bid bool) ([]eng
 		return nil, err
 	}
 	return h.engine.SubmitWithID(id, req.Size, req.Price, bid), nil
+}
+
+// getOrder 处理 GET /orders/{id}：查询一笔订单的生命周期状态。
+//
+// 覆盖已成交与已撤销的订单：它们虽已离开订单簿，历史状态仍需可查，
+// 前端轮询下单结果时正需要这个能力。
+func (h *Handler) getOrder(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
+	if err != nil || id == 0 {
+		writeError(w, http.StatusBadRequest, "id must be a positive integer")
+		return
+	}
+
+	status, ok := h.engine.Status(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "order not found")
+		return
+	}
+
+	side := "sell"
+	if status.Bid {
+		side = "buy"
+	}
+
+	writeJSON(w, http.StatusOK, orderStatusDTO{
+		OrderID:   status.ID,
+		Side:      side,
+		Price:     status.Price,
+		Size:      status.Size,
+		Filled:    status.Filled,
+		Remaining: status.Remaining,
+		State:     string(status.State),
+	})
 }
 
 // cancelOrder 处理 DELETE /orders/{id}：撤销一笔仍挂在订单簿上的订单。

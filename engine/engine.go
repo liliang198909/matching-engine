@@ -16,24 +16,49 @@ type PriceLevel struct {
 	Volume float64
 }
 
+// OrderState 是订单的生命周期状态。
+type OrderState string
+
+const (
+	StateOpen      OrderState = "open"      // 仍有剩余数量挂在订单簿上
+	StateFilled    OrderState = "filled"    // 已全部成交
+	StateCancelled OrderState = "cancelled" // 未成交部分已被撤销
+)
+
+// OrderStatus 是一笔订单从下单到完结的完整状态快照。
+//
+// 已成交、已撤销的订单会离开订单簿，但历史状态仍需可查，
+// 因此单独保留一份记录，而不是从订单簿反查。
+type OrderStatus struct {
+	ID        uint64
+	Price     float64
+	Bid       bool
+	Size      float64 // 下单时的原始数量
+	Filled    float64 // 累计成交量
+	Remaining float64 // 仍可成交或可撤的数量
+	State     OrderState
+}
+
 // Engine 撮合引擎。
 //
 // 订单簿与成交记录均为共享状态，外部可能从多个 goroutine 并发提交订单，
 // 因此所有读写路径统一由互斥锁串行化，保证数据一致性。
 type Engine struct {
-	mu     sync.Mutex
-	book   *Orderbook
-	trades []Trade
-	seq    uint64            // 订单自增序号
-	index  map[uint64]*Order // 挂单索引：订单 ID → 订单，撤单时 O(1) 定位
+	mu       sync.Mutex
+	book     *Orderbook
+	trades   []Trade
+	seq      uint64                  // 订单自增序号
+	index    map[uint64]*Order       // 挂单索引：订单 ID → 订单，撤单时 O(1) 定位
+	statuses map[uint64]*OrderStatus // 订单生命周期状态，含已成交与已撤销的订单
 }
 
 // NewEngine 创建撮合引擎。
 func NewEngine() *Engine {
 	return &Engine{
-		book:   NewOrderbook(),
-		trades: make([]Trade, 0),
-		index:  make(map[uint64]*Order),
+		book:     NewOrderbook(),
+		trades:   make([]Trade, 0),
+		index:    make(map[uint64]*Order),
+		statuses: make(map[uint64]*OrderStatus),
 	}
 }
 
@@ -140,13 +165,43 @@ func (e *Engine) cancelLocked(id uint64) bool {
 		e.book.RemoveLimit(limit)
 	}
 	delete(e.index, id)
+
+	if st, ok := e.statuses[id]; ok {
+		st.Remaining = 0
+		st.State = StateCancelled
+	}
 	return true
+}
+
+// Status 返回订单的生命周期状态。订单从未出现过时 ok 为 false。
+//
+// 返回的是副本：调用方拿到后随便用，不会被引擎后续修改影响。
+func (e *Engine) Status(id uint64) (OrderStatus, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	st, ok := e.statuses[id]
+	if !ok {
+		return OrderStatus{}, false
+	}
+	return *st, true
 }
 
 // submitLocked 是 SubmitOrder 与 SubmitWithID 的共同实现。
 // 调用前必须已持有 e.mu。
 func (e *Engine) submitLocked(id uint64, size, price float64, bid bool) []Trade {
 	o := NewOrder(id, size, bid)
+	o.Price = price
+
+	status := &OrderStatus{
+		ID:        id,
+		Price:     price,
+		Bid:       bid,
+		Size:      size,
+		Remaining: size,
+		State:     StateOpen,
+	}
+	e.statuses[id] = status
 
 	var filled []Trade
 	if bid {
@@ -155,10 +210,15 @@ func (e *Engine) submitLocked(id uint64, size, price float64, bid bool) []Trade 
 		filled = e.matchAsk(o, price)
 	}
 
+	status.Filled = size - o.Size
+	status.Remaining = o.Size
+
 	// 仍有剩余则挂单，成为后续订单的对手盘
 	if !o.IsFilled() {
 		e.book.PlaceOrder(price, o)
 		e.index[o.ID] = o
+	} else {
+		status.State = StateFilled
 	}
 
 	e.trades = append(e.trades, filled...)
@@ -232,6 +292,15 @@ func (e *Engine) fill(o, counter *Order, price float64) (Trade, bool) {
 		// 完全成交的订单不再可撤，必须从撤单索引里移除，
 		// 否则索引会一直持有已消失的订单，撤单也会误报成功。
 		delete(e.index, counter.ID)
+	}
+
+	// 被动方订单的状态也要同步累加，否则查单接口会把它当成未成交
+	if st, ok := e.statuses[counter.ID]; ok {
+		st.Filled += size
+		st.Remaining = counter.Size
+		if exhausted {
+			st.State = StateFilled
+		}
 	}
 	return trade, exhausted
 }

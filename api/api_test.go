@@ -272,3 +272,68 @@ func TestCancelKeepsOrderWhenStoreFails(t *testing.T) {
 		t.Fatalf("order vanished after failed cancel: asks=%v", depth.Asks)
 	}
 }
+
+func TestGetOrderStatus(t *testing.T) {
+	store := &fakeStore{nextID: 41} // 订单依次拿到 42、43
+	h := NewHandler(engine.NewEngine(), store).Routes()
+
+	do(t, h, http.MethodPost, "/orders", `{"side":"sell","price":100,"size":5}`)
+
+	// 刚下的卖单完全未成交
+	var st orderStatusDTO
+	rec := do(t, h, http.MethodGet, "/orders/42", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if st.OrderID != 42 || st.Side != "sell" || st.Price != 100 ||
+		st.Size != 5 || st.Filled != 0 || st.Remaining != 5 || st.State != "open" {
+		t.Fatalf("order status = %+v, want untouched sell order", st)
+	}
+
+	do(t, h, http.MethodPost, "/orders", `{"side":"buy","price":100,"size":3}`)
+
+	// 被动方部分成交：数量累加，状态仍为 open
+	rec = do(t, h, http.MethodGet, "/orders/42", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if st.Filled != 3 || st.Remaining != 2 || st.State != "open" {
+		t.Fatalf("partially filled status = %+v, want filled=3 remaining=2 open", st)
+	}
+
+	// 主动方被完全吃掉
+	rec = do(t, h, http.MethodGet, "/orders/43", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if st.State != "filled" || st.Remaining != 0 {
+		t.Fatalf("fully filled status = %+v, want filled", st)
+	}
+
+	do(t, h, http.MethodDelete, "/orders/42", "")
+
+	// 撤单后状态仍可查，且已成交部分保留
+	rec = do(t, h, http.MethodGet, "/orders/42", "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if st.State != "cancelled" || st.Remaining != 0 || st.Filled != 3 {
+		t.Fatalf("cancelled status = %+v, want cancelled with filled=3", st)
+	}
+}
+
+func TestGetOrderRejectsUnknownAndInvalidID(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	if rec := do(t, h, http.MethodGet, "/orders/999", ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown order: status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	for _, id := range []string{"abc", "0"} {
+		if rec := do(t, h, http.MethodGet, "/orders/"+id, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("id %s: status = %d, want %d", id, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
