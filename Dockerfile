@@ -7,8 +7,9 @@ FROM golang:1.27-alpine AS build
 WORKDIR /src
 
 # 先只拷贝依赖清单。这一层能被 Docker 缓存：
-# 只要 go.mod 没变，后续改代码就不会触发重新下载依赖。
-COPY go.mod ./
+# 只要 go.mod / go.sum 没变，后续改代码就不会触发重新下载依赖。
+# go.sum 必须一起拷贝：Go 用它校验依赖内容，缺了会导致构建失败。
+COPY go.mod go.sum ./
 RUN go mod download
 
 # 再拷贝源码并编译
