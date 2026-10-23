@@ -305,6 +305,25 @@ func (e *Engine) fill(o, counter *Order, price float64) (Trade, bool) {
 	return trade, exhausted
 }
 
+// TradePage 返回历史成交记录的一个窗口快照，并给出成交总数。
+//
+// 成交按产生顺序追加，因此 offset 从最早的一笔开始计算。
+// 窗口越界不算错误：offset 超过总数时返回空切片，客户端可以安全翻到最后一页。
+func (e *Engine) TradePage(offset, limit int) (trades []Trade, total int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	total = len(e.trades)
+	if offset >= total {
+		return []Trade{}, total
+	}
+
+	end := min(offset+limit, total)
+	out := make([]Trade, end-offset)
+	copy(out, e.trades[offset:end])
+	return out, total
+}
+
 // Trades 返回历史成交记录的副本快照。
 func (e *Engine) Trades() []Trade {
 	e.mu.Lock()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -322,6 +323,76 @@ func TestGetOrderStatus(t *testing.T) {
 	}
 	if st.State != "cancelled" || st.Remaining != 0 || st.Filled != 3 {
 		t.Fatalf("cancelled status = %+v, want cancelled with filled=3", st)
+	}
+}
+
+func TestGetTradesPaginated(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	// 造出两笔成交：一笔买单先吃掉 100 档，再吃掉 101 档
+	do(t, h, http.MethodPost, "/orders", `{"side":"sell","price":100,"size":5}`)
+	do(t, h, http.MethodPost, "/orders", `{"side":"sell","price":101,"size":5}`)
+	do(t, h, http.MethodPost, "/orders", `{"side":"buy","price":101,"size":8}`)
+
+	// 不带参数：默认 limit=100、offset=0，两笔全部返回
+	rec := do(t, h, http.MethodGet, "/trades", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var page tradesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 2 || page.Limit != defaultTradeLimit || page.Offset != 0 {
+		t.Fatalf("page meta = %+v, want total 2 limit %d offset 0", page, defaultTradeLimit)
+	}
+	if len(page.Trades) != 2 {
+		t.Fatalf("trades = %d, want 2", len(page.Trades))
+	}
+
+	// 逐页翻：offset 从最早一笔算起，两页的成交价应当依次是 100、101
+	wantPrices := []float64{100, 101}
+	for i, want := range wantPrices {
+		rec := do(t, h, http.MethodGet, "/trades?limit=1&offset="+strconv.Itoa(i), "")
+		if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if page.Total != 2 || len(page.Trades) != 1 {
+			t.Fatalf("offset %d: page = %+v, want exactly 1 of 2 trades", i, page)
+		}
+		if page.Trades[0].Price != want {
+			t.Fatalf("offset %d: price = %v, want %v", i, page.Trades[0].Price, want)
+		}
+	}
+
+	// 越界不报错：返回空数组而不是 null，客户端可以无脑遍历
+	rec = do(t, h, http.MethodGet, "/trades?offset=10", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("out of range: status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 2 || len(page.Trades) != 0 {
+		t.Fatalf("out of range: page = %+v, want empty page with total 2", page)
+	}
+}
+
+func TestGetTradesRejectsInvalidPaging(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	paths := []string{
+		"/trades?limit=0",
+		"/trades?limit=-1",
+		"/trades?limit=1001", // 超过单页上限，防止一次拉走全部历史
+		"/trades?limit=abc",
+		"/trades?offset=-1",
+		"/trades?offset=abc",
+	}
+	for _, path := range paths {
+		if rec := do(t, h, http.MethodGet, path, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want %d", path, rec.Code, http.StatusBadRequest)
+		}
 	}
 }
 

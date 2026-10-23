@@ -43,8 +43,9 @@ curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
 - **Order cancellation** — cancel a resting order by ID in O(1) via an ID index; emptied price levels are removed
 - **Order lifecycle queries** — completed and cancelled orders remain queryable, with `open` / `filled` / `cancelled` state plus filled and remaining size
 - **HTTP API** — a thin `net/http` layer exposes submit / status / cancel / depth / trades as JSON, with request validation and typed error responses
+- **Paginated trade history** — `/trades?limit=&offset=` returns a window plus the total count, with a hard cap of 1000 per page so one request cannot copy the entire log
 - **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 37 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, and the HTTP layer
+- **Full test suite** — 40 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, and the HTTP layer
 
 ## Quick Start
 
@@ -187,6 +188,9 @@ status, ok := e.Status(42) // ok=false if the order never existed
 
 // Full trade history (copy).
 all := e.Trades()
+
+// One page of trade history, plus the total number of trades.
+page, total := e.TradePage(0, 100) // offset, limit
 ```
 
 ```go
@@ -208,7 +212,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 | `GET` | `/orders/{id}` | Order status: `open` / `filled` / `cancelled`, with filled and remaining size |
 | `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
 | `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
-| `GET` | `/trades` | Full trade history |
+| `GET` | `/trades?limit=&offset=` | Paginated trade history (default 100, max 1000), oldest first |
 | `GET` | `/healthz` | Liveness probe for load balancers / container checks |
 
 ```bash
@@ -260,6 +264,17 @@ curl localhost:8080/orders/4
 # {"order_id":4,"side":"sell","price":100,"size":5,"filled":2,"remaining":0,"state":"cancelled"}
 ```
 
+Trade history is paged oldest-first, and each page reports the total so a client can compute the number of pages without guessing:
+
+```bash
+curl 'localhost:8080/trades?limit=1&offset=1'
+# {"trades":[{"price":100,"size":2,"bid_order":6,"ask_order":4}],"total":2,"limit":1,"offset":1}
+
+# An offset past the end is not an error — it is an empty page
+curl 'localhost:8080/trades?offset=999'
+# {"trades":[],"total":2,"limit":100,"offset":999}
+```
+
 Every rejection returns a JSON body with a single `error` field and an appropriate status code:
 
 ```bash
@@ -268,6 +283,9 @@ curl -X POST localhost:8080/orders -d '{"side":"hold","price":100,"size":1}'
 
 curl 'localhost:8080/depth?n=abc'
 # {"error":"n must be a positive integer"}       HTTP 400
+
+curl 'localhost:8080/trades?limit=5000'
+# {"error":"limit must be an integer between 1 and 1000"}   HTTP 400
 
 curl localhost:8080/orders
 # Method Not Allowed                             HTTP 405
@@ -350,7 +368,7 @@ A level that is fully consumed but left in the book would keep answering `BestBi
 | Both sides | sell orders crossing resting bids |
 | Snapshot | depth truncation, `Depth(0)`, volume positivity |
 | Concurrency | 100 goroutines submitting simultaneously, verified with `-race` |
-| HTTP layer | order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, 405 on wrong method |
+| HTTP layer | order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method |
 
 ```bash
 go test ./... -race

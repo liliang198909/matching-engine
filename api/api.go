@@ -20,6 +20,15 @@ import (
 // defaultDepth 是查询盘口时默认返回的档位数。
 const defaultDepth = 5
 
+// 成交历史的分页参数约束。
+//
+// 不设上限的话，一次 /trades 请求就能把整个成交历史复制一遍，
+// 历史越长响应越慢、内存峰值越高，本质上是给客户端留了一个放大攻击面。
+const (
+	defaultTradeLimit = 100
+	maxTradeLimit     = 1000
+)
+
 // persistTimeout 限制一次落库的最长耗时，避免数据库卡住时请求无限等待。
 const persistTimeout = 5 * time.Second
 
@@ -153,9 +162,15 @@ type depthResponse struct {
 	Asks []levelDTO `json:"asks"`
 }
 
-// tradesResponse 是历史成交响应。
+// tradesResponse 是历史成交的分页响应。
+//
+// 一并返回 total / limit / offset，客户端不必再猜边界：
+// 用 total 就能算出总页数，也不会把「最后一页不满」误判成请求出错。
 type tradesResponse struct {
 	Trades []tradeDTO `json:"trades"`
+	Total  int        `json:"total"`
+	Limit  int        `json:"limit"`
+	Offset int        `json:"offset"`
 }
 
 // errorResponse 是统一的错误响应体，永远只有一个 error 字段。
@@ -319,9 +334,30 @@ func (h *Handler) getDepth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// getTrades 处理 GET /trades：返回全部历史成交。
+// getTrades 处理 GET /trades?limit=&offset=：分页返回历史成交。
+//
+// 成交按产生顺序存放，offset 从最早的一笔算起。
+// 两个参数都可省略；越界不报错，返回空数组即可。
 func (h *Handler) getTrades(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, tradesResponse{Trades: toTradeDTOs(h.engine.Trades())})
+	limit, err := intParam(r, "limit", defaultTradeLimit)
+	if err != nil || limit <= 0 || limit > maxTradeLimit {
+		writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+		return
+	}
+
+	offset, err := intParam(r, "offset", 0)
+	if err != nil || offset < 0 {
+		writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+		return
+	}
+
+	trades, total := h.engine.TradePage(offset, limit)
+	writeJSON(w, http.StatusOK, tradesResponse{
+		Trades: toTradeDTOs(trades),
+		Total:  total,
+		Limit:  limit,
+		Offset: offset,
+	})
 }
 
 // health 供负载均衡器和容器健康检查使用，只需返回 200。
@@ -346,6 +382,18 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 // writeError 写出统一格式的错误响应。
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg})
+}
+
+// intParam 解析整数查询参数；参数缺失时返回默认值。
+//
+// 只负责"能不能转成整数"，取值范围由调用方按各自的语义判断：
+// limit 的下界是 1，offset 的下界是 0，两者规则不同，不适合塞进同一个函数。
+func intParam(r *http.Request, name string, def int) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return def, nil
+	}
+	return strconv.Atoi(raw)
 }
 
 // toTradeDTOs 把引擎的成交记录转换为对外结构。

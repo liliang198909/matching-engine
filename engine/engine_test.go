@@ -429,3 +429,35 @@ func TestOrderStatusLifecycle(t *testing.T) {
 		t.Error("不存在的订单不应可查询")
 	}
 }
+
+func TestTradePage(t *testing.T) {
+	e := NewEngine()
+
+	// 三对完全成交的订单，各产生一笔成交，价格依次为 100、101、102
+	for _, price := range []float64{100, 101, 102} {
+		e.SubmitOrder(5, price, false)
+		e.SubmitOrder(5, price, true)
+	}
+
+	trades, total := e.TradePage(0, 10)
+	if total != 3 || len(trades) != 3 {
+		t.Fatalf("全量 = %d 笔 / total %d，期望 3 笔", len(trades), total)
+	}
+
+	// 窗口按产生顺序切分：offset=1 从第二笔开始
+	page, total := e.TradePage(1, 2)
+	if total != 3 || len(page) != 2 {
+		t.Fatalf("窗口 = %d 笔 / total %d，期望 2 笔", len(page), total)
+	}
+	if page[0].Price != 101 || page[1].Price != 102 {
+		t.Errorf("窗口价格 = %v/%v，期望 101/102", page[0].Price, page[1].Price)
+	}
+
+	// 越界返回空切片而不是报错，且不能破坏已有历史
+	if page, total := e.TradePage(99, 10); len(page) != 0 || total != 3 {
+		t.Errorf("越界窗口 = %d 笔 / total %d，期望 0 笔", len(page), total)
+	}
+	if all := e.Trades(); len(all) != 3 {
+		t.Errorf("分页后历史 = %d 笔，期望仍为 3", len(all))
+	}
+}
