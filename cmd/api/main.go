@@ -17,11 +17,18 @@ import (
 )
 
 func main() {
-	// 监听地址优先取环境变量，便于部署时由容器或平台注入；
-	// 未设置则用本地开发默认值。
+	// 监听地址的优先级：ADDR > PORT > 默认值。
+	//
+	// PORT 是 Render、Koyeb、Heroku 这类托管平台的约定：平台在运行时
+	// 动态注入端口号，服务必须监听它，否则平台的健康检查找不到实例。
+	// 这是个通用的十二要素应用惯例，加上后本地和云端用同一份代码。
 	addr := os.Getenv("ADDR")
 	if addr == "" {
-		addr = ":8080"
+		if port := os.Getenv("PORT"); port != "" {
+			addr = ":" + port
+		} else {
+			addr = ":8080"
+		}
 	}
 
 	// 显式构造 http.Server 而不是直接用 http.ListenAndServe：

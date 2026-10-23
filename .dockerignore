@@ -1,0 +1,21 @@
+# 构建上下文里不需要的东西：全部排除，减小镜像体积、加快构建
+.git
+.gitignore
+.dockerignore
+
+# 部署与文档文件，镜像内不需要
+Dockerfile
+docker-compose.yml
+*.md
+
+# 本地编译产物与测试文件
+/matching-engine
+/demo
+*.test
+*.out
+coverage.txt
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store

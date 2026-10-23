@@ -50,6 +50,26 @@ Demo output:
   ...
 ```
 
+## Deployment
+
+The service ships as a multi-stage Docker image: the build stage compiles a static binary with `CGO_ENABLED=0`, the runtime stage keeps only that binary plus CA certificates and runs as an unprivileged user (UID 10001). No Go toolchain ends up in the final image.
+
+```bash
+docker compose up -d --build   # build and start
+docker compose ps              # api should report healthy
+docker compose logs -f api     # tail logs
+docker compose down            # stop and clean up
+```
+
+The listen address resolves as `ADDR` → `PORT` → `:8080`, so the same image runs locally and on platforms that inject `$PORT` (Render, Koyeb, Heroku). A `/healthz` endpoint is exposed for load-balancer and container health probes.
+
+Because the binary is fully static, it also runs without Docker at all — cross-compile and copy it to any Linux host:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags="-s -w" -o matching-engine ./cmd/api
+```
+
 ## Architecture
 
 ```

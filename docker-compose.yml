@@ -1,0 +1,42 @@
+# 本地开发与单机部署用的编排文件。
+#
+# 用法：
+#   docker compose up -d --build    # 构建并后台启动
+#   docker compose ps               # 查看状态（health 字段应为 healthy）
+#   docker compose logs -f api      # 跟踪日志
+#   docker compose down             # 停止并清理
+#
+# 说明：最新版 Compose 不再需要顶层的 version 字段，写上会收到弃用警告。
+
+services:
+  api:
+    build: .
+    image: matching-engine:local
+    container_name: matching-engine-api
+
+    ports:
+      # 左边是宿主机端口，右边是容器内端口。
+      # 公网部署时建议写成 "127.0.0.1:8080:8080"，让容器只对
+      # 本机反向代理（Nginx/Caddy）开放，而不是直接暴露给外网。
+      - "8080:8080"
+
+    environment:
+      ADDR: ":8080"
+
+    # 容器崩溃或宿主机重启后自动拉起（除非人工 stop）
+    restart: unless-stopped
+
+    healthcheck:
+      # alpine 自带 busybox 的 wget，不必额外安装 curl
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      # 启动后等 5 秒再开始探活，避免把正常启动判成失败
+      start_period: 5s
+
+    # 给容器设个上限，防止它吃光小内存 VPS
+    deploy:
+      resources:
+        limits:
+          memory: 256M
