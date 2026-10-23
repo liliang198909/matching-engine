@@ -9,11 +9,11 @@ Standard library for everything except the PostgreSQL driver (`pgx`).
 A running instance is exposed over HTTPS:
 
 ```
-https://4814f94a7b78918a-39-148-102-232.serveousercontent.com
+https://6737fb592b51fe80-39-148-102-232.serveousercontent.com
 ```
 
 ```bash
-BASE=https://4814f94a7b78918a-39-148-102-232.serveousercontent.com
+BASE=https://6737fb592b51fe80-39-148-102-232.serveousercontent.com
 
 curl $BASE/healthz
 # {"status":"ok"}
@@ -32,6 +32,20 @@ curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
 > while that process is running and the URL changes when it restarts. The
 > commands above are the full API surface — everything can equally be reproduced
 > locally with `go run ./cmd/api`.
+
+The tunnel is maintained by [`scripts/tunnel.sh`](scripts/tunnel.sh), which survives
+the frequent SSH drops by reconnecting and rewriting the current address to
+`/tmp/matching-engine-tunnel.url`:
+
+```bash
+scripts/tunnel.sh                       # random URL, printed on every reconnect
+SUBDOMAIN=matching-engine scripts/tunnel.sh   # stable URL, after registering your SSH key
+cat /tmp/matching-engine-tunnel.url     # the address that is live right now
+```
+
+Serveo only honours `SUBDOMAIN` after the SSH key is registered (it prints a
+`console.serveo.net` link on first connect); without that step the hostname is
+random and changes on each reconnect.
 
 ## Features
 
