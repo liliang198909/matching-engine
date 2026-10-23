@@ -9,6 +9,31 @@
 # 说明：最新版 Compose 不再需要顶层的 version 字段，写上会收到弃用警告。
 
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: matching-engine-db
+
+    environment:
+      POSTGRES_USER: matching
+      POSTGRES_PASSWORD: matching
+      POSTGRES_DB: matching
+
+    # 数据目录挂到命名卷，容器删掉重建也不会丢历史订单
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    # 只对本机开放，外网访问不到数据库
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U matching -d matching"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+    restart: unless-stopped
+
   api:
     build: .
     image: matching-engine:local
@@ -22,6 +47,14 @@ services:
 
     environment:
       ADDR: ":8080"
+      # sslmode=disable：容器网络内的本地连接不加密。
+      # 跨公网连数据库时必须改成 require 或 verify-full。
+      DATABASE_URL: "postgres://matching:matching@db:5432/matching?sslmode=disable"
+
+    # 等数据库健康检查通过再启动 api，否则第一次连接必然失败
+    depends_on:
+      db:
+        condition: service_healthy
 
     # 容器崩溃或宿主机重启后自动拉起（除非人工 stop）
     restart: unless-stopped
@@ -40,3 +73,6 @@ services:
       resources:
         limits:
           memory: 256M
+
+volumes:
+  pgdata:

@@ -46,7 +46,58 @@ func (e *Engine) SubmitOrder(size, price float64, bid bool) []Trade {
 	defer e.mu.Unlock()
 
 	e.seq++
-	o := NewOrder(e.seq, size, bid)
+	return e.submitLocked(e.seq, size, price, bid)
+}
+
+// SubmitWithID 用调用方指定的 ID 提交订单。
+//
+// 两种场景会用到它：
+//  1. 正常情况下由数据库序列分配 ID，保证重启后编号连续、不与历史订单撞号
+//  2. 启动时回放历史订单，ID 直接取自数据库
+func (e *Engine) SubmitWithID(id uint64, size, price float64, bid bool) []Trade {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 自增游标至少要越过这次使用的 ID，否则后续 SubmitOrder 会复用编号。
+	if id > e.seq {
+		e.seq = id
+	}
+	return e.submitLocked(id, size, price, bid)
+}
+
+// ReplayOrder 是回放历史订单所需的最小输入。
+//
+// 用引擎自己的结构体而不是直接接收数据库的行类型，
+// 是为了保持依赖方向：engine 不认识 store，store 也不用认识 engine。
+type ReplayOrder struct {
+	ID    uint64
+	Size  float64
+	Price float64
+	Bid   bool
+}
+
+// Replay 按给定顺序重新提交历史订单，重建订单簿与成交历史。
+//
+// 撮合过程是确定性的：订单的到达顺序、价格、数量一旦确定，
+// 每一笔成交的对手方和成交量也唯一确定。时间戳只影响同价位内的
+// 先后排序，而回放按 ID 递增提交，到达顺序本就一致。
+// 因此回放结束后，内存状态与进程退出前完全等价。
+func (e *Engine) Replay(orders []ReplayOrder) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, o := range orders {
+		if o.ID > e.seq {
+			e.seq = o.ID
+		}
+		e.submitLocked(o.ID, o.Size, o.Price, o.Bid)
+	}
+}
+
+// submitLocked 是 SubmitOrder 与 SubmitWithID 的共同实现。
+// 调用前必须已持有 e.mu。
+func (e *Engine) submitLocked(id uint64, size, price float64, bid bool) []Trade {
+	o := NewOrder(id, size, bid)
 
 	var filled []Trade
 	if bid {

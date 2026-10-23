@@ -2,18 +2,18 @@
 
 A limit order book matching engine written in Go, implementing price-time priority with partial fills and a concurrency-safe order book.
 
-Zero third-party dependencies — standard library only.
+Standard library for everything except the PostgreSQL driver (`pgx`).
 
 ## Live Demo
 
 A running instance is exposed over HTTPS:
 
 ```
-https://09da9343f012e84b-39-148-102-232.serveousercontent.com
+https://85a5387dfec8bd3a-39-148-102-232.serveousercontent.com
 ```
 
 ```bash
-BASE=https://09da9343f012e84b-39-148-102-232.serveousercontent.com
+BASE=https://85a5387dfec8bd3a-39-148-102-232.serveousercontent.com
 
 curl $BASE/healthz
 # {"status":"ok"}
@@ -41,7 +41,8 @@ curl -X POST $BASE/orders -d '{"side":"buy","price":100,"size":3}'
 - **Concurrency-safe** — all shared state is serialized through a mutex, verified under `go test -race`
 - **Market depth snapshot** — query the top *n* levels of both sides at any time
 - **HTTP API** — a thin `net/http` layer exposes submit / depth / trades as JSON, with request validation and typed error responses
-- **Full test suite** — 23 tests covering matching, priority, book invariants, concurrency, and the HTTP layer
+- **Durable** — every order is appended to a PostgreSQL order log before it is matched; on startup the log is replayed to rebuild the book and trade history
+- **Full test suite** — 26 tests covering matching, priority, book invariants, concurrency, recovery, and the HTTP layer
 
 ## Quick Start
 
@@ -55,8 +56,19 @@ go test ./...        # run the test suite
 go test ./... -race  # verify concurrency safety
 
 go run ./cmd/demo    # run the interactive demo
-go run ./cmd/api     # start the HTTP server on :8080
+go run ./cmd/api     # start the HTTP server on :8080 (in-memory)
 ```
+
+To persist orders, point `DATABASE_URL` at a PostgreSQL instance. The schema is created on startup, so an empty database is enough:
+
+```bash
+createdb matching
+DATABASE_URL="postgres://$USER@127.0.0.1:5432/matching?sslmode=disable" \
+  go run ./cmd/api
+# 2026/10/23 15:40:42 restored 0 orders, rebuilt 0 trades
+```
+
+Without `DATABASE_URL` the service runs in memory only and logs a warning — handy for a quick look, wrong for anything real.
 
 Demo output:
 
@@ -83,11 +95,13 @@ Demo output:
 
 The service ships as a multi-stage Docker image: the build stage compiles a static binary with `CGO_ENABLED=0`, the runtime stage keeps only that binary plus CA certificates and runs as an unprivileged user (UID 10001). No Go toolchain ends up in the final image.
 
+`docker compose` also brings up PostgreSQL 16 with a named volume, and the API waits for its health check before starting:
+
 ```bash
-docker compose up -d --build   # build and start
-docker compose ps              # api should report healthy
+docker compose up -d --build   # build and start api + db
+docker compose ps              # both should report healthy
 docker compose logs -f api     # tail logs
-docker compose down            # stop and clean up
+docker compose down            # stop (the pgdata volume keeps the order log)
 ```
 
 The listen address resolves as `ADDR` → `PORT` → `:8080`, so the same image runs locally and on platforms that inject `$PORT` (Render, Koyeb, Heroku). A `/healthz` endpoint is exposed for load-balancer and container health probes.
@@ -228,6 +242,44 @@ Design choices worth noting:
 - **No locks in the API layer.** `Engine` already serializes every mutation behind a mutex, so handlers can call it from concurrent requests without extra coordination.
 - **No silent fallbacks on bad input.** `n=abc` returns 400 rather than quietly using the default. A client that sends garbage should learn about it immediately.
 - **`ReadHeaderTimeout` is set explicitly.** The zero-value `http.Server` has no timeouts, letting a slow-header connection hold a goroutine indefinitely.
+
+## Persistence
+
+Orders are appended to PostgreSQL *before* they are matched. That order log is the only source of truth — trades are not stored in a separate table.
+
+```sql
+CREATE TABLE orders (
+    id         BIGSERIAL PRIMARY KEY,
+    side       TEXT             NOT NULL CHECK (side IN ('buy', 'sell')),
+    price      DOUBLE PRECISION NOT NULL CHECK (price > 0),
+    size       DOUBLE PRECISION NOT NULL CHECK (size > 0),
+    created_at TIMESTAMPTZ      NOT NULL DEFAULT now()
+);
+```
+
+```
+POST /orders
+   │
+   ├─ INSERT ... RETURNING id ──► PostgreSQL order log
+   │        │
+   │        └─ id comes from the sequence, not from memory
+   ▼
+engine.SubmitWithID(id, size, price, bid) ──► in-memory book + trades
+```
+
+On startup the service replays the log in ID order through the same matching code that serves live traffic:
+
+```
+orders (id asc) ──► Replay ──► Orderbook + Trades
+```
+
+Why replay instead of a second trades table:
+
+- **One source of truth.** Two tables can disagree, and a half-written pair is the kind of bug you find days later. Matching is deterministic, so the trade list is a pure function of the order log.
+- **Crash consistency.** A `201` means the order is already durable. If the process dies after the insert but before matching, the next start matches it — no lost or duplicated fills.
+- **ID continuity.** The database sequence assigns order IDs, so they keep increasing across restarts instead of resetting to 1 and colliding with history.
+
+Known limits, stated on purpose: startup replay is O(n) and fine only while the log is small; prices are `DOUBLE PRECISION` because the engine is `float64` (a production exchange would use fixed-point); and a single API replica owns the book, since matching is in-memory.
 
 ## Design Notes
 

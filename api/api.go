@@ -6,10 +6,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/liliang198909/matching-engine/engine"
 )
@@ -17,17 +20,31 @@ import (
 // defaultDepth 是查询盘口时默认返回的档位数。
 const defaultDepth = 5
 
+// persistTimeout 限制一次落库的最长耗时，避免数据库卡住时请求无限等待。
+const persistTimeout = 5 * time.Second
+
+// OrderStore 是接入层对持久化层的全部要求。
+//
+// 只声明用到的方法，而不是直接依赖 *store.Postgres：
+// 依赖的是能力（能追加一条订单日志），不是某个具体实现。
+// 好处是测试里可以塞一个假实现，不必真的连数据库。
+type OrderStore interface {
+	InsertOrder(ctx context.Context, side string, price, size float64) (uint64, error)
+}
+
 // Handler 持有引擎实例，为每个 HTTP 请求提供入口。
 //
 // 这里不需要额外加锁：engine.Engine 内部已用互斥锁保护共享状态，
 // 多个请求并发调用 SubmitOrder 是安全的。
 type Handler struct {
 	engine *engine.Engine
+	orders OrderStore // 为 nil 时退化为纯内存模式
 }
 
 // NewHandler 创建 HTTP 处理器。
-func NewHandler(e *engine.Engine) *Handler {
-	return &Handler{engine: e}
+// orders 传 nil 表示不落盘，服务重启后订单与成交全部丢失。
+func NewHandler(e *engine.Engine, orders OrderStore) *Handler {
+	return &Handler{engine: e, orders: orders}
 }
 
 // Routes 注册全部路由，返回可直接交给 http.Server 的 http.Handler。
@@ -142,8 +159,39 @@ func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	trades := h.engine.SubmitOrder(req.Size, req.Price, bid)
+	trades, err := h.submit(r.Context(), req, bid)
+	if err != nil {
+		// 落库失败就必须拒绝请求：如果先撮合后写库，
+		// 写库失败会导致内存里的订单簿包含了数据库没有的订单，
+		// 重启回放后状态就对不上了。宁可让调用方重试。
+		log.Printf("persist order: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "could not persist order")
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, orderResponse{Trades: toTradeDTOs(trades)})
+}
+
+// submit 先落库拿到订单 ID，再让引擎按该 ID 撮合。
+//
+// 为什么不直接调 engine.SubmitOrder 写库？那样订单 ID 由引擎自己数，
+// 进程重启后会从 1 重新开始，与历史订单撞号。交给数据库序列分配，
+// 编号才能跨重启保持唯一且连续。
+func (h *Handler) submit(ctx context.Context, req orderRequest, bid bool) ([]engine.Trade, error) {
+	if h.orders == nil {
+		return h.engine.SubmitOrder(req.Size, req.Price, bid), nil
+	}
+
+	// 与客户端连接解绑：写库一旦提交，即使客户端已断开也应算成功，
+	// 否则会出现「数据库有、返回却说失败」的裂缝，重启回放时凭空多出订单。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	defer cancel()
+
+	id, err := h.orders.InsertOrder(ctx, req.Side, req.Price, req.Size)
+	if err != nil {
+		return nil, err
+	}
+	return h.engine.SubmitWithID(id, req.Size, req.Price, bid), nil
 }
 
 // getDepth 处理 GET /depth?n=5：返回盘口前 n 档。

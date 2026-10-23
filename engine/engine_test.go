@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -234,5 +235,53 @@ func TestConcurrentSubmit(t *testing.T) {
 	bids, asks := e.Depth(10)
 	if len(bids) != 0 || len(asks) != 0 {
 		t.Errorf("数量完全匹配后订单簿应为空，实际 bids=%v asks=%v", bids, asks)
+	}
+}
+
+// TestReplayRebuildsState 验证「订单日志回放」能把状态复原。
+//
+// 这是持久化的正确性基础：只要回放后的订单簿和成交历史与崩溃前一致，
+// 数据库里就只需要存订单，不必再单独存一份成交记录。
+func TestReplayRebuildsState(t *testing.T) {
+	orig := NewEngine()
+
+	// 覆盖挂单、部分成交、跨越多个档位扫单三种情况
+	orig.SubmitOrder(5, 101, false)
+	orig.SubmitOrder(3, 100, false)
+	orig.SubmitOrder(4, 102, false)
+	orig.SubmitOrder(6, 101, true) // 吃掉 100×3，再吃 101×2
+	orig.SubmitOrder(2, 99, true)  // 买价低于卖价，挂入买盘
+
+	wantTrades := orig.Trades()
+	wantBids, wantAsks := orig.Depth(5)
+
+	replay := []ReplayOrder{
+		{ID: 1, Size: 5, Price: 101, Bid: false},
+		{ID: 2, Size: 3, Price: 100, Bid: false},
+		{ID: 3, Size: 4, Price: 102, Bid: false},
+		{ID: 4, Size: 6, Price: 101, Bid: true},
+		{ID: 5, Size: 2, Price: 99, Bid: true},
+	}
+
+	restored := NewEngine()
+	restored.Replay(replay)
+
+	if got := restored.Trades(); !reflect.DeepEqual(got, wantTrades) {
+		t.Errorf("回放后成交历史 = %v, 期望 %v", got, wantTrades)
+	}
+	gotBids, gotAsks := restored.Depth(5)
+	if !reflect.DeepEqual(gotBids, wantBids) || !reflect.DeepEqual(gotAsks, wantAsks) {
+		t.Errorf("回放后盘口 = bids %v asks %v, 期望 bids %v asks %v",
+			gotBids, gotAsks, wantBids, wantAsks)
+	}
+
+	// 回放结束后新订单必须接着最大历史 ID，不能从 1 重新开始
+	trades := restored.SubmitOrder(1, 99, false)
+	if len(trades) != 1 {
+		t.Fatalf("成交笔数 = %d, 期望 1", len(trades))
+	}
+	if trades[0].AskOrder != 6 || trades[0].BidOrder != 5 {
+		t.Errorf("新订单 ID = %d, 期望 6；对手方 = %d, 期望 5",
+			trades[0].AskOrder, trades[0].BidOrder)
 	}
 }
