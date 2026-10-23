@@ -2,7 +2,8 @@
 
 A limit order book matching engine written in Go, implementing price-time priority with partial fills and a concurrency-safe order book.
 
-Standard library for everything except the PostgreSQL driver (`pgx`).
+Standard library for everything except the PostgreSQL driver (`pgx`) and the
+WebSocket upgrade (`gorilla/websocket`).
 
 ## Live Demo
 
@@ -13,7 +14,8 @@ https://liliang-matching.serveousercontent.com
 ```
 
 The base URL itself returns a JSON index of every endpoint, so opening it in a
-browser shows what the service offers instead of a bare 404.
+browser shows what the service offers instead of a bare 404. The live feed is at
+`wss://liliang-matching.serveousercontent.com/ws`.
 
 ```bash
 BASE=https://liliang-matching.serveousercontent.com
@@ -60,8 +62,9 @@ the hostname is random and changes on every reconnect.
 - **Order lifecycle queries** — completed and cancelled orders remain queryable, with `open` / `filled` / `cancelled` state plus filled and remaining size
 - **HTTP API** — a thin `net/http` layer exposes submit / status / cancel / depth / trades as JSON, with request validation and typed error responses
 - **Paginated trade history** — `/trades?limit=&offset=` returns a window plus the total count, with a hard cap of 1000 per page so one request cannot copy the entire log
+- **Real-time feed** — a WebSocket at `/ws` pushes a depth snapshot on connect, then every trade and book change as it happens; slow clients are dropped rather than allowed to block matching
 - **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 41 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, and the HTTP layer
+- **Full test suite** — 43 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, WebSocket fan-out, and the HTTP layer
 
 ## Quick Start
 
@@ -230,6 +233,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 | `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
 | `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
 | `GET` | `/trades?limit=&offset=` | Paginated trade history (default 100, max 1000), oldest first |
+| `GET` | `/ws` | WebSocket stream: depth snapshot on connect, then every trade and book change |
 | `GET` | `/healthz` | Liveness probe for load balancers / container checks |
 
 ```bash
@@ -292,6 +296,33 @@ curl 'localhost:8080/trades?offset=999'
 # {"trades":[],"total":2,"limit":100,"offset":999}
 ```
 
+`GET /ws` upgrades to a WebSocket and streams the same state without polling.
+The first frame is a depth snapshot; every subsequent order or cancellation
+pushes the resulting trades (if any) followed by the new book:
+
+```json
+{"type":"depth","depth":{"bids":[],"asks":[{"price":100,"volume":5}]}}
+{"type":"trade","trade":{"price":100,"size":3,"bid_order":2,"ask_order":1}}
+{"type":"depth","depth":{"bids":[],"asks":[{"price":100,"volume":2}]}}
+```
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws');
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'trade') {
+    console.log('trade', msg.trade);
+  } else {
+    console.log('book', msg.depth.bids, msg.depth.asks);
+  }
+};
+```
+
+Depth frames are full snapshots rather than deltas, so a client that misses one
+still converges on the next. Each subscriber has a bounded buffer, and a client
+that falls behind is skipped for that frame instead of stalling matching.
+
 Every rejection returns a JSON body with a single `error` field and an appropriate status code:
 
 ```bash
@@ -312,6 +343,7 @@ Design choices worth noting:
 
 - **DTOs instead of direct serialization.** `engine.Trade` and `engine.PriceLevel` carry no `json` tags. Adding them would bind the domain model's field names to the wire protocol, so a later refactor of the engine would silently break API compatibility. The extra `tradeDTO` / `levelDTO` types keep the two layers independently evolvable.
 - **No locks in the API layer.** `Engine` already serializes every mutation behind a mutex, so handlers can call it from concurrent requests without extra coordination.
+- **Push never blocks matching.** The hub serializes each message once and fans it out into per-client buffered channels with a non-blocking send. A slow or dead connection loses that frame rather than stalling the order path; depth is a snapshot, so it self-heals on the next update.
 - **No silent fallbacks on bad input.** `n=abc` returns 400 rather than quietly using the default. A client that sends garbage should learn about it immediately.
 - **`ReadHeaderTimeout` is set explicitly.** The zero-value `http.Server` has no timeouts, letting a slow-header connection hold a goroutine indefinitely.
 
@@ -386,6 +418,7 @@ A level that is fully consumed but left in the book would keep answering `BestBi
 | Snapshot | depth truncation, `Depth(0)`, volume positivity |
 | Concurrency | 100 goroutines submitting simultaneously, verified with `-race` |
 | HTTP layer | service index, order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method |
+| WebSocket | hub fan-out to multiple subscribers, unsubscribe closing the channel, idempotent cancel, end-to-end stream (snapshot on connect, trade then depth after a fill) |
 
 ```bash
 go test ./... -race
@@ -395,8 +428,8 @@ go test ./... -race
 
 - Market orders and cancel/replace
 - Per-side locking or a single-threaded command loop
-- Write-ahead log for crash recovery
-- WebSocket market-data push (trades + depth)
+- Snapshot + delta market data instead of full depth frames
+- API keys and rate limiting
 
 ## License
 

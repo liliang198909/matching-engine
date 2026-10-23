@@ -408,8 +408,8 @@ func TestIndexListsEndpoints(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &idx); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if idx.Service != "matching-engine" || len(idx.Endpoints) != 6 {
-		t.Fatalf("index = %+v, want service and 6 endpoints", idx)
+	if idx.Service != "matching-engine" || len(idx.Endpoints) != 7 {
+		t.Fatalf("index = %+v, want service and 7 endpoints", idx)
 	}
 
 	// 索引只挂根路径，不能变成兜底路由把未知路径也接住

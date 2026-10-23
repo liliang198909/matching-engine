@@ -49,12 +49,13 @@ type OrderStore interface {
 type Handler struct {
 	engine *engine.Engine
 	orders OrderStore // 为 nil 时退化为纯内存模式
+	hub    *Hub       // WebSocket 订阅者广播中心
 }
 
 // NewHandler 创建 HTTP 处理器。
 // orders 传 nil 表示不落盘，服务重启后订单与成交全部丢失。
 func NewHandler(e *engine.Engine, orders OrderStore) *Handler {
-	return &Handler{engine: e, orders: orders}
+	return &Handler{engine: e, orders: orders, hub: NewHub()}
 }
 
 // Routes 注册全部路由，返回可直接交给 http.Server 的 http.Handler。
@@ -73,6 +74,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("DELETE /orders/{id}", h.cancelOrder)
 	mux.HandleFunc("GET /depth", h.getDepth)
 	mux.HandleFunc("GET /trades", h.getTrades)
+	mux.HandleFunc("GET /ws", h.stream)
 	mux.HandleFunc("GET /healthz", h.health)
 
 	return mux
@@ -197,6 +199,14 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
+// wsMessage 是 WebSocket 推送的统一信封，用 type 字段区分两种消息：
+// "depth" 携带完整盘口快照，"trade" 携带单笔成交。
+type wsMessage struct {
+	Type  string         `json:"type"`
+	Depth *depthResponse `json:"depth,omitempty"`
+	Trade *tradeDTO      `json:"trade,omitempty"`
+}
+
 // ---------------------------------------------------------------- handler
 
 // index 处理 GET /：返回服务名与全部端点，方便直接打开链接时看到用法。
@@ -209,6 +219,7 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request) {
 			{Method: "DELETE", Path: "/orders/{id}", Purpose: "Cancel a resting order"},
 			{Method: "GET", Path: "/depth?n=5", Purpose: "Top-n market depth for both sides"},
 			{Method: "GET", Path: "/trades?limit=&offset=", Purpose: "Paginated trade history, oldest first"},
+			{Method: "GET", Path: "/ws", Purpose: "WebSocket stream: depth snapshots and live trades"},
 			{Method: "GET", Path: "/healthz", Purpose: "Liveness probe"},
 		},
 	})
@@ -240,6 +251,9 @@ func (h *Handler) submitOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "could not persist order")
 		return
 	}
+
+	h.broadcastTrades(trades)
+	h.broadcastDepth()
 
 	writeJSON(w, http.StatusCreated, orderResponse{Trades: toTradeDTOs(trades)})
 }
@@ -330,6 +344,8 @@ func (h *Handler) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "order not found or already filled")
 		return
 	}
+
+	h.broadcastDepth()
 
 	writeJSON(w, http.StatusOK, cancelResponse{OrderID: id, Cancelled: true})
 }
@@ -439,14 +455,19 @@ func intParam(r *http.Request, name string, def int) (int, error) {
 func toTradeDTOs(trades []engine.Trade) []tradeDTO {
 	out := make([]tradeDTO, 0, len(trades))
 	for _, t := range trades {
-		out = append(out, tradeDTO{
-			Price:    t.Price,
-			Size:     t.Size,
-			BidOrder: t.BidOrder,
-			AskOrder: t.AskOrder,
-		})
+		out = append(out, toTradeDTO(t))
 	}
 	return out
+}
+
+// toTradeDTO 转换单笔成交，供批量转换与 WebSocket 单笔推送共用。
+func toTradeDTO(t engine.Trade) tradeDTO {
+	return tradeDTO{
+		Price:    t.Price,
+		Size:     t.Size,
+		BidOrder: t.BidOrder,
+		AskOrder: t.AskOrder,
+	}
 }
 
 // toLevelDTOs 把盘口档位转换为对外结构。
