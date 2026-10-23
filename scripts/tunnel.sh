@@ -6,8 +6,8 @@
 # 重新复制链接、改 README，所以这里把「连上 -> 输出地址 -> 断了重连」做成循环。
 #
 # 用法:
-#   scripts/tunnel.sh                    # 随机子域名，地址每次都可能变
-#   SUBDOMAIN=matching-engine scripts/tunnel.sh   # 固定子域名，地址稳定
+#   scripts/tunnel.sh                       # 随机子域名，地址每次都可能变
+#   SUBDOMAIN=liliang-matching scripts/tunnel.sh  # 已预留的子域名，地址稳定
 #
 # 可选环境变量:
 #   LOCAL_PORT  本地服务端口，默认 8080
