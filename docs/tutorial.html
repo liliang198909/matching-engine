@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matching Engine 教学页：从订单到成交</title>
+<style>
+:root {
+  --paper: #FAFAF7;
+  --panel: #FFFFFF;
+  --ink: #16181D;
+  --muted: #5C6370;
+  --line: #E3E3DC;
+  --accent: #0E7C4A;
+  --accent-soft: #EAF4EE;
+  --sell: #B8431B;
+  --buy: #0E7C4A;
+  --code-bg: #F2F2ED;
+  --radius: 10px;
+  --maxw: 960px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #121316;
+    --panel: #191B1F;
+    --ink: #E8E8E4;
+    --muted: #9AA0AA;
+    --line: #2A2D33;
+    --accent: #4CCB8B;
+    --accent-soft: #153025;
+    --sell: #E0704A;
+    --buy: #4CCB8B;
+    --code-bg: #1F2227;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 16px/1.7 "PingFang SC", "Noto Sans SC", system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+code, pre, .mono { font-family: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+code {
+  font-size: 0.88em;
+  background: var(--code-bg);
+  padding: 0.12em 0.36em;
+  border-radius: 5px;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+header {
+  padding: 56px 24px 40px;
+  border-bottom: 1px solid var(--line);
+}
+header .inner, main, footer .inner { max-width: var(--maxw); margin: 0 auto; }
+.eyebrow {
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+h1 {
+  font-size: clamp(30px, 5vw, 44px);
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  margin: 0 0 16px;
+  font-weight: 650;
+}
+.lede { font-size: 17px; color: var(--muted); max-width: 40em; margin: 0 0 22px; }
+.meta { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; color: var(--muted); }
+.meta span { border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; }
+main { padding: 0 24px 80px; }
+nav.toc {
+  margin: 0 0 8px;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  font-size: 14px;
+}
+nav.toc a { color: var(--muted); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); }
+section { padding: 44px 0; border-bottom: 1px solid var(--line); }
+section:last-of-type { border-bottom: none; }
+h2 {
+  font-size: 26px;
+  line-height: 1.3;
+  margin: 0 0 8px;
+  letter-spacing: -0.01em;
+  font-weight: 650;
+}
+h2 .num { color: var(--muted); font-weight: 400; margin-right: 10px; font-size: 0.72em; }
+h3 { font-size: 18px; margin: 30px 0 10px; font-weight: 600; }
+p { margin: 0 0 14px; }
+ul, ol { margin: 0 0 16px; padding-left: 1.4em; }
+li { margin: 0 0 7px; }
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-soft);
+  padding: 12px 16px;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  margin: 18px 0;
+  font-size: 15px;
+}
+.note strong { font-weight: 600; }
+table { width: 100%; border-collapse: collapse; margin: 18px 0; font-size: 14.5px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; }
+td code { white-space: nowrap; }
+
+/* ---------- 交互演示 ---------- */
+.demo {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 14px;
+  padding: 20px;
+  margin: 22px 0;
+}
+.demo-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.demo-head h4 { margin: 0; font-size: 16px; font-weight: 600; }
+.demo-head .hint { font-size: 13px; color: var(--muted); }
+.book-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 680px) { .book-grid { grid-template-columns: 1fr; } }
+.side h5 { margin: 0 0 8px; font-size: 13px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+.rows { list-style: none; margin: 0; padding: 0; min-height: 96px; }
+.rows li {
+  display: grid;
+  grid-template-columns: 64px 1fr 56px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  transition: background 160ms ease;
+}
+.rows li.flash { background: var(--accent-soft); }
+.rows .bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.rows .bar i { display: block; height: 100%; width: 0; transition: width 220ms ease; }
+.side.asks .bar i { background: var(--sell); }
+.side.bids .bar i { background: var(--buy); }
+.rows .price { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13.5px; }
+.side.asks .price { color: var(--sell); }
+.side.bids .price { color: var(--buy); }
+.rows .vol { text-align: right; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; color: var(--muted); }
+.empty { color: var(--muted); font-size: 13px; padding: 8px; }
+
+form.order { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 18px 0 10px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button {
+  border: 0; background: none; color: var(--muted);
+  padding: 9px 16px; font: inherit; font-size: 14px; cursor: pointer;
+}
+.seg button.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+label.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--muted); }
+label.field input {
+  width: 96px; padding: 8px 10px; font: inherit; font-size: 14px;
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--paper); color: var(--ink);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+button.primary {
+  border: 0; border-radius: 8px; padding: 10px 18px;
+  background: var(--accent); color: #fff; font: inherit; font-size: 14px; font-weight: 600;
+  cursor: pointer;
+}
+button.primary:disabled { opacity: 0.5; cursor: default; }
+button.ghost {
+  border: 1px solid var(--line); background: none; color: var(--muted);
+  border-radius: 8px; padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.log {
+  margin-top: 14px;
+  border-top: 1px dashed var(--line);
+  padding-top: 14px;
+  font-size: 13.5px;
+  min-height: 76px;
+}
+.log p { margin: 0 0 6px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 12.5px; color: var(--muted); }
+.log p.hit { color: var(--accent); }
+.log p.rest { color: var(--ink); }
+.log .payload { margin-top: 10px; }
+.log .payload pre { margin: 0; font-size: 12.5px; }
+.demo-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; }
+
+/* ---------- 面试问答 ---------- */
+details {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  margin: 0 0 10px;
+  background: var(--panel);
+}
+details summary { cursor: pointer; font-weight: 550; font-size: 15px; }
+details[open] summary { margin-bottom: 8px; }
+details p { margin: 0 0 8px; font-size: 14.5px; }
+footer { border-top: 1px solid var(--line); padding: 28px 24px 48px; color: var(--muted); font-size: 13.5px; }
+footer .inner { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+@media print { nav.toc, .demo, footer { display: none; } body { background: #fff; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="inner">
+    <p class="eyebrow">Project Walkthrough</p>
+    <h1>撮合引擎到底在做什么</h1>
+    <p class="lede">这是一份配合代码阅读的讲解页：先建立直觉，再拆数据结构，然后用一个可以点的盘口演示走完撮合，最后讲清楚 HTTP、持久化和推送各自解决什么问题。读完你应该能不看稿子把整个流程讲出来。</p>
+    <div class="meta">
+      <span>Go 1.27</span>
+      <span>PostgreSQL 事件日志</span>
+      <span>WebSocket 推送</span>
+      <span>43 个测试</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <nav class="toc">
+    <a href="#intuition">1 直觉</a>
+    <a href="#data">2 数据结构</a>
+    <a href="#match">3 撮合演示</a>
+    <a href="#code">4 代码怎么写的</a>
+    <a href="#http">5 HTTP 层</a>
+    <a href="#durable">6 持久化</a>
+    <a href="#push">7 实时推送</a>
+    <a href="#interview">8 面试问答</a>
+    <a href="#run">9 跑起来</a>
+  </nav>
+
+  <section id="intuition">
+    <h2><span class="num">01</span>先建立一个直觉</h2>
+    <p>交易所里没有"自动成交"这回事，所有成交都来自某个人主动接受别人的报价。撮合引擎要做的只有两件事：</p>
+    <ul>
+      <li><strong>排队</strong>：没人接的订单按价格、按时间排进订单簿。</li>
+      <li><strong>配对</strong>：新来的订单如果和对面能对上，就按对方的价格成交，一直吃到对不上或自己吃完为止。</li>
+    </ul>
+    <p>整个项目就是把这两件事做成一个可以公网访问、重启不丢数据的服务。剩下的 HTTP、PostgreSQL、WebSocket 都是在它外面加的三层壳：</p>
+    <table>
+      <tr><th>层</th><th>回答什么问题</th><th>去掉会怎样</th></tr>
+      <tr><td><code>engine</code></td><td>谁能和谁成交、成交多少、成交价是多少</td><td>项目不存在</td></tr>
+      <tr><td><code>api</code></td><td>外部怎么提交、查询、撤销订单</td><td>只能写 Go 代码调用</td></tr>
+      <tr><td><code>store</code></td><td>进程重启后数据从哪里回来</td><td>一重启订单全丢</td></tr>
+      <tr><td><code>/ws</code></td><td>客户端怎么不用轮询就看到变化</td><td>只能不停问接口</td></tr>
+    </table>
+    <div class="note">
+      <strong>一句话记法：</strong>engine 是大脑，api 是柜台，store 是账本，ws 是广播喇叭。
+    </div>
+  </section>
+
+  <section id="data">
+    <h2><span class="num">02</span>三层嵌套的数据结构</h2>
+    <p>订单簿不是一张平表，而是"抽屉里还有抽屉"：</p>
+    <pre><code>Orderbook
+├── Bids []*Limit            买盘，价格从高到低
+├── Asks []*Limit            卖盘，价格从低到高
+├── BidLimits map[float64]*Limit   价格 → 档位（买）
+└── AskLimits map[float64]*Limit   价格 → 档位（卖）
+
+Limit（一个价格档位，例如"卖 100"）
+├── Price        float64
+├── Bid          bool
+├── Orders       []*Order    同一价格上排队的订单，先来先成交
+└── TotalVolume  float64     该档位剩余总量
+
+Order（一笔委托）
+├── ID        uint64
+├── Size      float64    剩余未成交数量（会变小）
+├── Price     float64    委托价（永不变）
+├── Bid       bool
+├── Timestamp int64
+└── Limit     *Limit     指回所在档位；离开档位后置 nil</code></pre>
+
+    <h3>为什么这样设计</h3>
+    <ul>
+      <li><strong>为什么要两层索引？</strong>撮合永远只看最优价，用有序切片取首元素是 O(1)；而撤单要先按价格找到档位，用哈希表也是 O(1)。两套索引指向同一批 <code>Limit</code>，所以必须由 <code>Orderbook</code> 一个对象统一维护，不能各存一份。</li>
+      <li><strong>为什么 <code>Orders</code> 用切片不用链表？</strong>新单永远追加到尾部，天然就是时间优先；撮合只从头部取，也很自然。</li>
+      <li><strong>为什么删除要保序？</strong>常见做法是与尾部交换做到 O(1)，但那会打乱到达顺序，直接破坏"同价先到先成交"。这里故意用 O(n) 换正确性，面试时这是个很好的取舍点。</li>
+      <li><strong>为什么 <code>Order.Price</code> 和 <code>Limit</code> 要各存一份？</strong>订单离开档位后 <code>Limit</code> 会被清空，此时查单仍要知道它挂的什么价。</li>
+    </ul>
+
+    <h3>Engine 上还挂着四样东西</h3>
+    <table>
+      <tr><th>字段</th><th>作用</th><th>没有它会怎样</th></tr>
+      <tr><td><code>mu</code></td><td>一把互斥锁，串行化所有读写</td><td>并发下单直接数据竞争</td></tr>
+      <tr><td><code>index</code></td><td>订单 ID → 订单指针</td><td>撤单要扫全簿</td></tr>
+      <tr><td><code>statuses</code></td><td>订单 ID → 生命周期状态</td><td>成交后查不到历史订单</td></tr>
+      <tr><td><code>trades</code></td><td>全部成交记录</td><td>没有历史成交接口</td></tr>
+    </table>
+    <p><code>statuses</code> 是很容易被忽略的一层：订单一旦成交或撤销就不在订单簿里了，但客户端仍然要能查到结果，所以状态必须独立保存。</p>
+  </section>
+
+  <section id="match">
+    <h2><span class="num">03</span>亲手点一次撮合</h2>
+    <p>下面这个小盘口和真实引擎用同一套规则：<strong>价格优先、同价时间优先、成交价取被动方（先挂单方）的价格</strong>。提交几笔订单，看盘口和成交是怎么变化的。</p>
+
+    <div class="demo">
+      <div class="demo-head">
+        <h4>订单簿模拟</h4>
+        <span class="hint">成交价永远是挂单方的价格，不吃点差</span>
+      </div>
+      <div class="book-grid">
+        <div class="side asks">
+          <h5>卖盘 Asks · 价低优先</h5>
+          <ul class="rows" id="ask-rows"></ul>
+        </div>
+        <div class="side bids">
+          <h5>买盘 Bids · 价高优先</h5>
+          <ul class="rows" id="bid-rows"></ul>
+        </div>
+      </div>
+
+      <form class="order" id="order-form">
+        <div class="seg" role="group" aria-label="方向">
+          <button type="button" data-side="buy" class="active" aria-pressed="true">买入</button>
+          <button type="button" data-side="sell" aria-pressed="false">卖出</button>
+        </div>
+        <label class="field">价格
+          <input id="price" type="number" value="102" min="1" step="1" required>
+        </label>
+        <label class="field">数量
+          <input id="size" type="number" value="4" min="1" step="1" required>
+        </label>
+        <button class="primary" type="submit" id="submit">提交订单</button>
+      </form>
+
+      <div class="log" id="log" aria-live="polite"></div>
+
+      <div class="demo-foot">
+        <span class="hint">提示：卖单挂 100×5、102×3，买盘 99×2</span>
+        <button class="ghost" type="button" id="reset">重置盘口</button>
+      </div>
+    </div>
+
+    <p>观察三件事：</p>
+    <ol>
+      <li>买 102×4 时，先吃 100 这一档（<strong>价格优先</strong>），成交价是 100 而不是 102。</li>
+      <li>如果 100 档有两笔单，先挂的那笔先成交（<strong>时间优先</strong>）。</li>
+      <li>没吃完的剩余量会变成一笔新的挂单，进入对面盘口排队。</li>
+    </ol>
+  </section>
+
+  <section id="code">
+    <h2><span class="num">04</span>撮合循环只有十来行</h2>
+    <p>真实代码在 <code>engine/engine.go</code>。把注释剥掉，主干就这么点：</p>
+    <pre><code>func (e *Engine) submitLocked(id uint64, size, price float64, bid bool) []Trade {
+    o := NewOrder(id, size, bid)
+    o.Price = price
+
+    var filled []Trade
+    if bid {
+        filled = e.matchBid(o, price)      // 买单去扫卖盘
+    } else {
+        filled = e.matchAsk(o, price)      // 卖单去扫买盘
+    }
+
+    if !o.IsFilled() {
+        e.book.PlaceOrder(price, o)        // 没吃完就挂上
+        e.index[o.ID] = o
+    }
+    e.trades = append(e.trades, filled...)
+    return filled
+}</code></pre>
+    <p><code>matchBid</code> 是一个循环，每一轮：</p>
+    <ol>
+      <li>取对面最优档位；如果价格已经不交叉，直接退出。</li>
+      <li>取该档位最早的一笔订单，成交量 = <code>min(剩余量, 对方剩余量)</code>。</li>
+      <li>生成一笔成交，双方剩余量同时扣减。</li>
+      <li>如果对方被吃满，从档位删除；档位空了，整个档位移除。</li>
+      <li>自己吃满了就结束，否则继续下一轮。</li>
+    </ol>
+    <div class="note">
+      <strong>成交价为什么取对方的价格？</strong>因为先挂单的人先做出了价格承诺，后到的人只能接受。这也解释了为什么市价大单会一路吃到更差的价位（滑点）。
+    </div>
+    <p>每一次 <code>fill</code> 还会同步更新被动方在 <code>statuses</code> 里的累计成交量和剩余量——状态表不是事后算的，而是随撮合一起维护的。</p>
+  </section>
+
+  <section id="http">
+    <h2><span class="num">05</span>HTTP 层：把函数变成服务</h2>
+    <p><code>api</code> 包不了解撮合细节，它只做四件事：解析 JSON、校验参数、调引擎、编码响应。引擎也完全不知道 HTTP 的存在——这条边界让两边都能独立修改。</p>
+    <pre><code>POST   /orders          下单，返回本次产生的成交
+GET    /orders/{id}     查订单状态（open / filled / cancelled）
+DELETE /orders/{id}     撤单
+GET    /depth?n=5       盘口前 n 档
+GET    /trades?limit=&offset=   历史成交分页
+GET    /ws              WebSocket 实时推送
+GET    /healthz         健康检查</code></pre>
+    <p>几个值得记住的实现细节：</p>
+    <ul>
+      <li>路由用 Go 1.22 的"方法 + 路径"模式，方法不对时标准库自动返回 405，不用手写判断。</li>
+      <li>根路径写成 <code>GET /{$}</code> 而不是 <code>GET /</code>，否则它会变成兜底路由，把所有未知路径都接住，404 就废了。</li>
+      <li>参数错误一律 400 并说明原因，不做"静默用默认值"的兜底。</li>
+      <li>响应使用独立 DTO，而不是直接序列化引擎类型，避免协议绑死内部字段名。</li>
+    </ul>
+  </section>
+
+  <section id="durable">
+    <h2><span class="num">06</span>持久化：只存事件，不存结果</h2>
+    <p>很多实现会存"订单表 + 成交表"，这里只有一个 <code>events</code> 表，记录两类事件：下单和撤单。</p>
+    <pre><code>CREATE TABLE events (
+    id         BIGSERIAL PRIMARY KEY,
+    kind       TEXT NOT NULL CHECK (kind IN ('order', 'cancel')),
+    side       TEXT CHECK (side IN ('buy', 'sell')),
+    price      DOUBLE PRECISION CHECK (price &gt; 0),
+    size       DOUBLE PRECISION CHECK (size &gt; 0),
+    cancel_id  BIGINT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+    <p>启动时按 <code>id</code> 顺序把这些事件重放一遍，订单簿和成交历史就原样回来了。之所以可行，是因为撮合是<strong>确定性</strong>的：同样的输入顺序，必然得到同样的结果。</p>
+    <h3>两个关键顺序问题</h3>
+    <ul>
+      <li><strong>先落库，再改内存。</strong>写库失败就返回 503 且不动内存；反过来的话，会出现"内存有、库里没有"，重启后账本对不上。</li>
+      <li><strong>下单和撤单必须共用同一个序列。</strong>否则回放时只能"先放所有下单、再放所有撤单"，与真实的交错顺序不一致，订单会复活或消失。</li>
+    </ul>
+    <p>订单 ID 由数据库序列分配，所以进程重启后编号仍然连续、不撞号；引擎内部的 <code>seq</code> 只在纯内存模式下使用。</p>
+  </section>
+
+  <section id="push">
+    <h2><span class="num">07</span>实时推送：为什么轮询不够</h2>
+    <p>盘口每秒都可能变，客户端每秒问一次接口既慢又浪费。WebSocket 建立一条长连接，服务端主动推：</p>
+    <pre><code>连上           → {"type":"depth","depth":{...}}        先给一份快照
+有人挂单       → {"type":"depth","depth":{...}}        盘口变了
+发生成交       → {"type":"trade","trade":{...}}        逐笔成交
+               → {"type":"depth","depth":{...}}        新的盘口</code></pre>
+    <ul>
+      <li>盘口推的是<strong>全量快照</strong>而不是增量，客户端直接覆盖本地状态即可，丢一帧也不会错位。</li>
+      <li>每个订阅者一个有界缓冲通道，发送是非阻塞的：某个浏览器卡住，只丢它自己那一帧，撮合主流程绝不等网络。</li>
+      <li>先订阅、再发首帧快照，堵住"快照写完到订阅生效之间"的变化空窗。</li>
+    </ul>
+  </section>
+
+  <section id="interview">
+    <h2><span class="num">08</span>面试里最可能被追问的八个问题</h2>
+    <details>
+      <summary>价格优先和时间优先分别是怎么保证的？</summary>
+      <p>价格优先靠 <code>Bids</code>/<code>Asks</code> 两个按价格排序的切片，撮合永远取首元素。时间优先靠档位内 <code>Orders</code> 的插入顺序：新单追加到尾部，撮合从头部取；删除时保序，不与尾部交换。</p>
+    </details>
+    <details>
+      <summary>下单和撤单的复杂度是多少？</summary>
+      <p>下单 O(k)，k 是被扫过的档位数，每档还要做一次常数级撮合；撤单 O(1) 定位（靠 <code>index</code>）+ O(m) 保序删除（m 是档内订单数）；查单与深度都是 O(1) 和 O(n)。</p>
+    </details>
+    <details>
+      <summary>并发安全怎么做的？会不会有性能问题？</summary>
+      <p>整个引擎一把互斥锁，等价于"单写者模型"：所有变更串行执行，读也加锁。实现简单、语义清楚，代价是多核无法并行撮合。要扩容通常是分交易对/分片，而不是把单簿拆锁——同一订单簿的撮合本身就要求全序。</p>
+    </details>
+    <details>
+      <summary>为什么不用"订单表 + 成交表"？</summary>
+      <p>两张表写入存在半成功风险，且成交是撮合的推导结果，重复存储会有一致性问题。只存事件、启动回放，天然满足崩溃一致性，也只有一个事实来源。</p>
+    </details>
+    <details>
+      <summary>重启时怎么保证状态和崩溃前一模一样？</summary>
+      <p>因为撮合是确定性的，回放相同顺序的事件必然得到相同状态。前提是下单与撤单共用同一序列，保证交错顺序可还原；并且先落库再改内存，保证内存状态是库状态的子集。</p>
+    </details>
+    <details>
+      <summary>回放会不会越来越慢？</summary>
+      <p>会，目前是 O(事件数) 的启动成本，适合演示规模。生产做法是周期性打快照 + 只回放快照之后的事件。</p>
+    </details>
+    <details>
+      <summary>WebSocket 慢客户端会不会拖垮服务？</summary>
+      <p>不会。广播是序列化一次、非阻塞分发；每个连接有 16 条缓冲，满了就跳过这一帧。盘口是全量快照，下一帧自动收敛；成交推送丢了也能用 <code>/trades</code> 补。</p>
+    </details>
+    <details>
+      <summary>这个项目离生产还差什么？</summary>
+      <p>市价单与改单、账户与资金校验、快照加速启动、鉴权与限流、多副本与故障切换。这些都能在 README 的 Possible Extensions 里找到。</p>
+    </details>
+  </section>
+
+  <section id="run">
+    <h2><span class="num">09</span>自己跑一遍</h2>
+    <pre><code>git clone https://github.com/liliang198909/matching-engine.git
+cd matching-engine
+
+go test ./... -race          # 43 个测试，含并发检查
+
+createdb matching             # 可选：不配库也能跑，内存模式
+DATABASE_URL="postgres://$USER@127.0.0.1:5432/matching?sslmode=disable" \
+  go run ./cmd/api            # 启动后监听 :8080</code></pre>
+    <pre><code># 挂一笔卖单（不会成交）
+curl -X POST localhost:8080/orders -d '{"side":"sell","price":100,"size":5}'
+
+# 买 3 手，按卖单的价格成交
+curl -X POST localhost:8080/orders -d '{"side":"buy","price":100,"size":3}'
+# {"trades":[{"price":100,"size":3,"bid_order":2,"ask_order":1}]}
+
+# 重新读取盘口：卖 100 还剩 2 手
+curl 'localhost:8080/depth?n=5'</code></pre>
+    <p>线上冒烟测试可以直接打开 <a href="https://liliang-matching.serveousercontent.com/" target="_blank" rel="noreferrer">在线实例</a>，根路径会列出全部接口。</p>
+  </section>
+</main>
+
+<footer>
+  <div class="inner">
+    <span>matching-engine 教学页</span>
+    <a href="https://github.com/liliang198909/matching-engine" target="_blank" rel="noreferrer">源码与 README</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var state = { asks: [], bids: [], nextId: 1, side: 'buy', running: false };
+
+  var askRows = document.getElementById('ask-rows');
+  var bidRows = document.getElementById('bid-rows');
+  var logBox = document.getElementById('log');
+  var form = document.getElementById('order-form');
+  var submitBtn = document.getElementById('submit');
+  var priceInput = document.getElementById('price');
+  var sizeInput = document.getElementById('size');
+
+  function resetState() {
+    state.asks = [{ price: 100, vol: 5 }, { price: 102, vol: 3 }];
+    state.bids = [{ price: 99, vol: 2 }];
+    state.nextId = 4;
+    state.running = false;
+    submitBtn.disabled = false;
+  }
+
+  function sortBook() {
+    state.asks.sort(function (a, b) { return a.price - b.price; });
+    state.bids.sort(function (a, b) { return b.price - a.price; });
+  }
+
+  function maxVol() {
+    var all = state.asks.concat(state.bids);
+    var m = 0;
+    for (var i = 0; i < all.length; i++) { if (all[i].vol > m) m = all[i].vol; }
+    return m || 1;
+  }
+
+  function renderSide(rowsEl, levels, kind, flashPrice) {
+    rowsEl.innerHTML = '';
+    var m = maxVol();
+    if (!levels.length) {
+      var li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = '空';
+      rowsEl.appendChild(li);
+      return;
+    }
+    levels.slice(0, 5).forEach(function (lvl) {
+      var li = document.createElement('li');
+      if (flashPrice !== null && lvl.price === flashPrice) li.className = 'flash';
+
+      var price = document.createElement('span');
+      price.className = 'price';
+      price.textContent = lvl.price.toFixed(0);
+
+      var bar = document.createElement('span');
+      bar.className = 'bar';
+      var fill = document.createElement('i');
+      fill.style.width = Math.max(6, Math.round((lvl.vol / m) * 100)) + '%';
+      bar.appendChild(fill);
+
+      var vol = document.createElement('span');
+      vol.className = 'vol';
+      vol.textContent = '×' + lvl.vol;
+
+      li.appendChild(price);
+      li.appendChild(bar);
+      li.appendChild(vol);
+      rowsEl.appendChild(li);
+    });
+  }
+
+  function render(flashAsk, flashBid) {
+    sortBook();
+    renderSide(askRows, state.asks, 'ask', flashAsk == null ? null : flashAsk);
+    renderSide(bidRows, state.bids, 'bid', flashBid == null ? null : flashBid);
+  }
+
+  function addLog(text, cls) {
+    var p = document.createElement('p');
+    if (cls) p.className = cls;
+    p.textContent = text;
+    logBox.appendChild(p);
+  }
+
+  function addPayload(trades) {
+    var wrap = document.createElement('div');
+    wrap.className = 'payload';
+    var pre = document.createElement('pre');
+    var code = document.createElement('code');
+    code.textContent = JSON.stringify({ trades: trades }, null, 2);
+    pre.appendChild(code);
+    wrap.appendChild(pre);
+    logBox.appendChild(wrap);
+  }
+
+  function insertRest(side, price, vol) {
+    var book = side === 'buy' ? state.bids : state.asks;
+    for (var i = 0; i < book.length; i++) {
+      if (book[i].price === price) {
+        book[i].vol += vol;
+        return;
+      }
+    }
+    book.push({ price: price, vol: vol });
+  }
+
+  function clearLog() { logBox.innerHTML = ''; }
+
+  function seedLog() {
+    addLog('盘口已重置：卖 100×5 / 102×3，买 99×2', 'rest');
+  }
+
+  function runOrder(side, price, size) {
+    var trades = [];
+    var remaining = size;
+    var id = state.nextId++;
+
+    state.running = true;
+    submitBtn.disabled = true;
+    clearLog();
+    addLog('订单 #' + id + '：' + (side === 'buy' ? '买' : '卖') + ' ' + price + ' × ' + size);
+
+    var opposite = side === 'buy' ? state.asks : state.bids;
+
+    function step() {
+      var best = opposite[0];
+      var crosses = best && (side === 'buy' ? best.price <= price : best.price >= price);
+      if (!crosses || remaining <= 0) {
+        finish();
+        return;
+      }
+
+      var fill = Math.min(remaining, best.vol);
+      best.vol -= fill;
+      remaining -= fill;
+      trades.push({
+        price: best.price,
+        size: fill,
+        bid_order: side === 'buy' ? id : 0,
+        ask_order: side === 'sell' ? id : 0
+      });
+
+      addLog('成交 ' + fill + ' @ ' + best.price + '（' + (side === 'buy' ? '吃掉卖盘' : '吃掉买盘') + ' ' + best.price + ' 档）', 'hit');
+      render(side === 'buy' ? best.price : null, side === 'sell' ? best.price : null);
+
+      if (best.vol <= 0) { opposite.shift(); }
+
+      setTimeout(step, 420);
+    }
+
+    function finish() {
+      if (remaining > 0) {
+        insertRest(side, price, remaining);
+        addLog('剩余 ' + remaining + ' 手挂到' + (side === 'buy' ? '买盘' : '卖盘') + ' ' + price + ' 排队', 'rest');
+        render();
+      } else {
+        render();
+      }
+      addPayload(trades.map(function (t) {
+        var out = { price: t.price, size: t.size };
+        if (side === 'buy') { out.bid_order = t.bid_order; out.ask_order = 0; }
+        else { out.bid_order = 0; out.ask_order = t.ask_order; }
+        return out;
+      }));
+      if (!trades.length) addLog('没有可成交的对手盘，订单直接挂上', 'rest');
+      state.running = false;
+      submitBtn.disabled = false;
+    }
+
+    step();
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    if (state.running) return;
+    var price = Number(priceInput.value);
+    var size = Number(sizeInput.value);
+    if (!(price > 0) || !(size > 0)) return;
+    runOrder(state.side, Math.round(price), Math.round(size));
+  });
+
+  var segButtons = form.querySelectorAll('.seg button');
+  Array.prototype.forEach.call(segButtons, function (btn) {
+    btn.addEventListener('click', function () {
+      Array.prototype.forEach.call(segButtons, function (b) {
+        b.classList.remove('active');
+        b.setAttribute('aria-pressed', 'false');
+      });
+      btn.classList.add('active');
+      btn.setAttribute('aria-pressed', 'true');
+      state.side = btn.getAttribute('data-side');
+    });
+  });
+
+  document.getElementById('reset').addEventListener('click', function () {
+    if (state.running) return;
+    resetState();
+    render();
+    clearLog();
+    seedLog();
+  });
+
+  resetState();
+  render();
+  seedLog();
+})();
+</script>
+</body>
+</html>

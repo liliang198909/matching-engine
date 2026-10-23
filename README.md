@@ -5,6 +5,16 @@ A limit order book matching engine written in Go, implementing price-time priori
 Standard library for everything except the PostgreSQL driver (`pgx`) and the
 WebSocket upgrade (`gorilla/websocket`).
 
+## Tutorial
+
+An interactive single-page walkthrough (in Chinese) of how the engine works:
+data structures, the matching loop, persistence, WebSocket push, and the
+interview questions that follow from them — with a clickable order book demo
+that fills step by step.
+
+- in the repo: [docs/tutorial.html](docs/tutorial.html)
+- hosted: <https://liliang198909.github.io/matching-engine/tutorial.html>
+
 ## Live Demo
 
 A running instance is exposed over HTTPS:
