@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/liliang198909/matching-engine/chain"
 	"github.com/liliang198909/matching-engine/engine"
 )
 
@@ -408,14 +409,79 @@ func TestIndexListsEndpoints(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &idx); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if idx.Service != "matching-engine" || len(idx.Endpoints) != 7 {
-		t.Fatalf("index = %+v, want service and 7 endpoints", idx)
+	if idx.Service != "matching-engine" || len(idx.Endpoints) != 8 {
+		t.Fatalf("index = %+v, want service and 8 endpoints", idx)
 	}
 
 	// 索引只挂根路径，不能变成兜底路由把未知路径也接住
 	if rec := do(t, h, http.MethodGet, "/nope", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown path: status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
+}
+
+func TestGetTransfersRequiresChainModule(t *testing.T) {
+	// 没有挂 watcher 时应当明确说「能力没开」，而不是返回空列表。
+	h := NewHandler(engine.NewEngine(), nil).Routes()
+
+	if rec := do(t, h, http.MethodGet, "/transfers", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestGetTransfersPaginated(t *testing.T) {
+	store := &fakeTransferStore{
+		transfers: []chain.Transfer{
+			{Token: "0xtoken", BlockNumber: 100, TxHash: "0xaa", LogIndex: 0, From: "0xa", To: "0xb", Value: "1000000000000000000"},
+		},
+		total: 1,
+	}
+	h := NewHandler(engine.NewEngine(), nil).AttachTransfers(store).Routes()
+
+	rec := do(t, h, http.MethodGet, "/transfers?limit=10&offset=0", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp transfersResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Total != 1 || resp.Limit != 10 || resp.Offset != 0 {
+		t.Fatalf("meta = %+v", resp)
+	}
+	if len(resp.Transfers) != 1 || resp.Transfers[0].Value != "1000000000000000000" {
+		t.Fatalf("transfers = %+v, want exact decimal value preserved as string", resp.Transfers)
+	}
+	if store.lastOffset != 0 || store.lastLimit != 10 {
+		t.Fatalf("query = offset %d limit %d, want 0/10", store.lastOffset, store.lastLimit)
+	}
+}
+
+func TestGetTransfersRejectsInvalidPaging(t *testing.T) {
+	h := NewHandler(engine.NewEngine(), nil).AttachTransfers(&fakeTransferStore{}).Routes()
+
+	for _, path := range []string{"/transfers?limit=0", "/transfers?limit=1001", "/transfers?limit=abc", "/transfers?offset=-1"} {
+		if rec := do(t, h, http.MethodGet, path, ""); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want %d", path, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+// fakeTransferStore 让 /transfers 的测试不需要真的连数据库。
+type fakeTransferStore struct {
+	transfers  []chain.Transfer
+	total      int
+	err        error
+	lastOffset int
+	lastLimit  int
+}
+
+func (s *fakeTransferStore) TransferPage(_ context.Context, offset, limit int) ([]chain.Transfer, int, error) {
+	s.lastOffset, s.lastLimit = offset, limit
+	if s.err != nil {
+		return nil, 0, s.err
+	}
+	return s.transfers, s.total, nil
 }
 
 func TestGetOrderRejectsUnknownAndInvalidID(t *testing.T) {

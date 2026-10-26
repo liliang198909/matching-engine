@@ -8,12 +8,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
+	"github.com/ethereum/go-ethereum/ethclient"
+
 	"github.com/liliang198909/matching-engine/api"
+	"github.com/liliang198909/matching-engine/chain"
 	"github.com/liliang198909/matching-engine/engine"
 	"github.com/liliang198909/matching-engine/store"
 )
@@ -23,14 +27,34 @@ func main() {
 
 	// orders 为 nil 时 api 层退化为纯内存模式。
 	// 这样本地只想跑一跑、或者临时演示时，不需要先把数据库搭起来。
-	var orders api.OrderStore
+	var (
+		orders api.OrderStore
+		pg     *store.Postgres // 链上通道需要它；纯内存模式下为 nil
+	)
 	if dsn := os.Getenv("DATABASE_URL"); dsn == "" {
 		log.Print("DATABASE_URL is not set: running in memory only, state is lost on restart")
 	} else {
-		pg := openStore(dsn)
+		pg = openStore(dsn)
 		defer pg.Close()
 		orders = pg
 		restore(eng, pg)
+	}
+
+	handler := api.NewHandler(eng, orders)
+	if pg != nil {
+		handler.AttachTransfers(pg)
+	}
+
+	// 链上监听与 HTTP 服务共享同一个 ctx：进程退出时一起收敛。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cleanup, started, err := startChainWatcher(ctx, pg)
+	if err != nil {
+		log.Fatalf("start chain watcher: %v", err)
+	}
+	if started {
+		defer cleanup()
 	}
 
 	addr := listenAddr()
@@ -40,7 +64,7 @@ func main() {
 	// 能一直占用 goroutine，属于常见的资源耗尽风险。
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewHandler(eng, orders).Routes(),
+		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -83,6 +107,52 @@ func openStore(dsn string) *store.Postgres {
 		log.Fatalf("migrate schema: %v", err)
 	}
 	return pg
+}
+
+// startChainWatcher 按环境变量装配链上 Transfer 监听。
+//
+// 两个环境变量缺一不可：
+//   - CHAIN_RPC_URL   节点地址（https 即可，watcher 走轮询不依赖 wss）
+//   - ERC20_CONTRACT  要监听的合约地址
+//
+// 没有配置时返回 started=false，服务照常以纯撮合模式运行。
+// 配了但写错（地址非法、节点连不上）则直接终止启动——配置错误属于部署期问题，
+// 让它悄悄不生效比启动失败更难排查。
+func startChainWatcher(ctx context.Context, pg *store.Postgres) (cleanup func(), started bool, err error) {
+	rpcURL := os.Getenv("CHAIN_RPC_URL")
+	contractHex := os.Getenv("ERC20_CONTRACT")
+
+	if rpcURL == "" || contractHex == "" {
+		log.Print("CHAIN_RPC_URL / ERC20_CONTRACT not set: chain watcher disabled")
+		return nil, false, nil
+	}
+	if pg == nil {
+		// 没有数据库就没有游标和落库位置，链上通道无从谈起。
+		log.Print("chain watcher needs DATABASE_URL: disabled")
+		return nil, false, nil
+	}
+
+	token, err := chain.ParseToken(contractHex)
+	if err != nil {
+		return nil, false, err
+	}
+
+	client, err := ethclient.Dial(rpcURL)
+	if err != nil {
+		return nil, false, fmt.Errorf("dial chain node: %w", err)
+	}
+
+	w := chain.NewWatcher(chain.Config{
+		Source: chain.NewRPCSource(client, token),
+		Sink:   pg,
+	})
+	go w.Run(ctx)
+
+	log.Printf("chain watcher following %s", token.Hex())
+
+	// 返回 client.Close 而不是在这里 defer：
+	// 函数返回后 watcher 还要继续用这条连接，提前关闭会让它一直报错重试。
+	return client.Close, true, nil
 }
 
 // restore 用历史事件回放重建订单簿与成交记录。

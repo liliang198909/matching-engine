@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/liliang198909/matching-engine/chain"
 	"github.com/liliang198909/matching-engine/engine"
 )
 
@@ -29,6 +30,13 @@ const (
 	maxTradeLimit     = 1000
 )
 
+// 链上转账同样需要分页上限：一个热门 ERC20 合约一天可能有几十万条 Transfer，
+// 不设上限就是一个天然的放大攻击面。
+const (
+	defaultTransferLimit = 100
+	maxTransferLimit     = 1000
+)
+
 // persistTimeout 限制一次落库的最长耗时，避免数据库卡住时请求无限等待。
 const persistTimeout = 5 * time.Second
 
@@ -42,20 +50,40 @@ type OrderStore interface {
 	InsertCancel(ctx context.Context, orderID uint64) error
 }
 
+// TransferStore 是链上转账的只读查询能力。
+//
+// 与 OrderStore 分开声明，而不是合成一个大接口：
+// 调用方只依赖自己用到的方法，将来撮合走内存、链上走数据库这种混合部署
+// 也能各自满足所需的部分（Go 的接口是隐式实现的，拆分不产生额外成本）。
+type TransferStore interface {
+	TransferPage(ctx context.Context, offset, limit int) ([]chain.Transfer, int, error)
+}
+
 // Handler 持有引擎实例，为每个 HTTP 请求提供入口。
 //
 // 这里不需要额外加锁：engine.Engine 内部已用互斥锁保护共享状态，
 // 多个请求并发调用 SubmitOrder 是安全的。
 type Handler struct {
-	engine *engine.Engine
-	orders OrderStore // 为 nil 时退化为纯内存模式
-	hub    *Hub       // WebSocket 订阅者广播中心
+	engine    *engine.Engine
+	orders    OrderStore    // 为 nil 时退化为纯内存模式
+	transfers TransferStore // 为 nil 时 /transfers 返回 503
+	hub       *Hub          // WebSocket 订阅者广播中心
 }
 
 // NewHandler 创建 HTTP 处理器。
 // orders 传 nil 表示不落盘，服务重启后订单与成交全部丢失。
 func NewHandler(e *engine.Engine, orders OrderStore) *Handler {
 	return &Handler{engine: e, orders: orders, hub: NewHub()}
+}
+
+// AttachTransfers 可选地挂接链上转账查询能力。
+//
+// 用装配方法而不是多加一个构造参数：现有 18 处调用点无需改动，
+// 没有链接上模块的部署形态（纯撮合）保持原样即可。
+// 返回自身，便于链式写法 NewHandler(...).AttachTransfers(pg).Routes()。
+func (h *Handler) AttachTransfers(t TransferStore) *Handler {
+	h.transfers = t
+	return h
 }
 
 // Routes 注册全部路由，返回可直接交给 http.Server 的 http.Handler。
@@ -74,6 +102,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("DELETE /orders/{id}", h.cancelOrder)
 	mux.HandleFunc("GET /depth", h.getDepth)
 	mux.HandleFunc("GET /trades", h.getTrades)
+	mux.HandleFunc("GET /transfers", h.getTransfers)
 	mux.HandleFunc("GET /ws", h.stream)
 	mux.HandleFunc("GET /healthz", h.health)
 
@@ -178,6 +207,29 @@ type tradesResponse struct {
 	Offset int        `json:"offset"`
 }
 
+// transferDTO 是一条链上 ERC20 转账的对外表示。
+//
+// value 是十进制字符串而不是数字：链上金额是 256 位整数，
+// JSON 的 number 在多数语言里落到 float64，超过 2^53 就会悄悄丢精度。
+// 客户端拿到字符串后按需要转成 big.Int 或 decimal 处理。
+type transferDTO struct {
+	Token       string `json:"token"`
+	BlockNumber uint64 `json:"block_number"`
+	TxHash      string `json:"tx_hash"`
+	LogIndex    uint   `json:"log_index"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	Value       string `json:"value"`
+}
+
+// transfersResponse 是链上转账的分页响应。
+type transfersResponse struct {
+	Transfers []transferDTO `json:"transfers"`
+	Total     int           `json:"total"`
+	Limit     int           `json:"limit"`
+	Offset    int           `json:"offset"`
+}
+
 // endpointDTO 描述一个可调用的端点。
 type endpointDTO struct {
 	Method  string `json:"method"`
@@ -219,6 +271,7 @@ func (h *Handler) index(w http.ResponseWriter, r *http.Request) {
 			{Method: "DELETE", Path: "/orders/{id}", Purpose: "Cancel a resting order"},
 			{Method: "GET", Path: "/depth?n=5", Purpose: "Top-n market depth for both sides"},
 			{Method: "GET", Path: "/trades?limit=&offset=", Purpose: "Paginated trade history, oldest first"},
+			{Method: "GET", Path: "/transfers?limit=&offset=", Purpose: "ERC20 transfers observed on chain (requires chain watcher)"},
 			{Method: "GET", Path: "/ws", Purpose: "WebSocket stream: depth snapshots and live trades"},
 			{Method: "GET", Path: "/healthz", Purpose: "Liveness probe"},
 		},
@@ -410,6 +463,43 @@ func (h *Handler) getTrades(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getTransfers 处理 GET /transfers?limit=&offset=：分页返回链上 ERC20 转账。
+//
+// 未启用链上模块（没有装 watcher）时返回 503 而不是空列表：
+// 空列表会被误读成「链上没有转账」，503 才表达「这个能力没开」。
+func (h *Handler) getTransfers(w http.ResponseWriter, r *http.Request) {
+	if h.transfers == nil {
+		writeError(w, http.StatusServiceUnavailable, "chain watcher is not enabled")
+		return
+	}
+
+	limit, err := intParam(r, "limit", defaultTransferLimit)
+	if err != nil || limit <= 0 || limit > maxTransferLimit {
+		writeError(w, http.StatusBadRequest, "limit must be an integer between 1 and 1000")
+		return
+	}
+
+	offset, err := intParam(r, "offset", 0)
+	if err != nil || offset < 0 {
+		writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+		return
+	}
+
+	transfers, total, err := h.transfers.TransferPage(r.Context(), offset, limit)
+	if err != nil {
+		log.Printf("query chain transfers: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "could not read chain transfers")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, transfersResponse{
+		Transfers: toTransferDTOs(transfers),
+		Total:     total,
+		Limit:     limit,
+		Offset:    offset,
+	})
+}
+
 // health 供负载均衡器和容器健康检查使用，只需返回 200。
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -468,6 +558,24 @@ func toTradeDTO(t engine.Trade) tradeDTO {
 		BidOrder: t.BidOrder,
 		AskOrder: t.AskOrder,
 	}
+}
+
+// toTransferDTOs 把链上转账转换为对外结构。
+// 永远返回非 nil 切片，保证 JSON 输出是 [] 而不是 null。
+func toTransferDTOs(transfers []chain.Transfer) []transferDTO {
+	out := make([]transferDTO, 0, len(transfers))
+	for _, t := range transfers {
+		out = append(out, transferDTO{
+			Token:       t.Token,
+			BlockNumber: t.BlockNumber,
+			TxHash:      t.TxHash,
+			LogIndex:    t.LogIndex,
+			From:        t.From,
+			To:          t.To,
+			Value:       t.Value,
+		})
+	}
+	return out
 }
 
 // toLevelDTOs 把盘口档位转换为对外结构。

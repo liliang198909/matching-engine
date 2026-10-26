@@ -12,10 +12,14 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/liliang198909/matching-engine/chain"
 )
 
 // schema 是建表语句，使用 IF NOT EXISTS 以便每次启动都能安全执行。
@@ -64,6 +68,41 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_created_at_idx ON events (created_at);
 `
 
+// chainSchema 是链上数据的表结构，与撮合事件完全分开。
+//
+// 为什么不复用 events 表：events 是撮合引擎的事实来源，回放时必须
+// 逐条按顺序重建盘口。链上转账属于另一条写入路径，混进去会让回放
+// 读到无法解释的记录。两者唯一共享的只有「同一个数据库」。
+//
+// value 用 TEXT 而不是 NUMERIC：链上金额是 256 位整数，TEXT 保真无损，
+// 也避免了 numeric → big.Int 的额外编解码。代价是无法直接用 SQL 聚合，
+// 需要求和时在应用层用 big.Int 算——对演示规模完全够用。
+//
+// (tx_hash, log_index) 唯一：同一条日志被重复处理时靠 ON CONFLICT DO NOTHING
+// 幂等吞掉。进程在「写库」和「推进游标」之间崩溃就会重放同一区间，
+// 有这道约束才不会出现重复记录。
+const chainSchema = `
+CREATE TABLE IF NOT EXISTS chain_transfers (
+    id           BIGSERIAL PRIMARY KEY,
+    token        TEXT        NOT NULL,
+    block_number BIGINT      NOT NULL CHECK (block_number > 0),
+    tx_hash      TEXT        NOT NULL,
+    log_index    INT         NOT NULL,
+    from_addr    TEXT        NOT NULL,
+    to_addr      TEXT        NOT NULL,
+    value        TEXT        NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tx_hash, log_index)
+);
+
+CREATE INDEX IF NOT EXISTS chain_transfers_block_idx ON chain_transfers (block_number);
+
+CREATE TABLE IF NOT EXISTS chain_cursor (
+    id         SMALLINT PRIMARY KEY CHECK (id = 1),
+    last_block BIGINT   NOT NULL
+);
+`
+
 // EventRecord 是从数据库读回的一条事件日志。
 type EventRecord struct {
 	ID      uint64  // 事件自身的序号
@@ -103,6 +142,9 @@ func Open(ctx context.Context, dsn string) (*Postgres, error) {
 func (p *Postgres) Migrate(ctx context.Context) error {
 	if _, err := p.pool.Exec(ctx, schema); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
+	}
+	if _, err := p.pool.Exec(ctx, chainSchema); err != nil {
+		return fmt.Errorf("migrate chain schema: %w", err)
 	}
 	return nil
 }
@@ -163,6 +205,100 @@ func (p *Postgres) LoadEvents(ctx context.Context) ([]EventRecord, error) {
 		return nil, fmt.Errorf("iterate events: %w", err)
 	}
 	return out, nil
+}
+
+// LastChainBlock 读取链上数据处理到的高度。ok 为 false 表示从未处理过。
+func (p *Postgres) LastChainBlock(ctx context.Context) (uint64, bool, error) {
+	var last int64
+	err := p.pool.QueryRow(ctx, `SELECT last_block FROM chain_cursor WHERE id = 1`).Scan(&last)
+	if err != nil {
+		// 游标行不存在是「还没开始处理」，不是故障，用 ok=false 表达。
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("read chain cursor: %w", err)
+	}
+	return uint64(last), true, nil
+}
+
+// SaveTransfers 在一个事务里写入一批转账并推进游标。
+//
+// 两件事必须原子提交：如果先插入记录、后更新游标时崩溃，重启后会重扫
+// 同一区间（靠唯一约束幂等吞掉，仅浪费一次拉取）；反过来先更新游标、
+// 后插入记录时崩溃，那批转账就永久丢了——这才是真正不可接受的。
+// 放进同一事务，两种裂缝都不会出现。
+func (p *Postgres) SaveTransfers(ctx context.Context, transfers []chain.Transfer, lastBlock uint64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin chain tx: %w", err)
+	}
+	// 提交成功后再 Rollback 会返回 ErrTxClosed，属于正常路径，忽略即可。
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	for _, t := range transfers {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO chain_transfers (token, block_number, tx_hash, log_index, from_addr, to_addr, value)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tx_hash, log_index) DO NOTHING`,
+			t.Token, t.BlockNumber, t.TxHash, t.LogIndex, t.From, t.To, t.Value,
+		); err != nil {
+			return fmt.Errorf("insert transfer %s#%d: %w", t.TxHash, t.LogIndex, err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO chain_cursor (id, last_block) VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET last_block = EXCLUDED.last_block`,
+		lastBlock,
+	); err != nil {
+		return fmt.Errorf("advance chain cursor: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit chain tx: %w", err)
+	}
+	return nil
+}
+
+// TransferPage 分页读取链上转账，按区块高度与日志序号升序。
+//
+// 返回当前页与总条数，让调用方能算出总页数，不必自己猜边界。
+func (p *Postgres) TransferPage(ctx context.Context, offset, limit int) ([]chain.Transfer, int, error) {
+	var total int
+	if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM chain_transfers`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count chain transfers: %w", err)
+	}
+
+	rows, err := p.pool.Query(ctx, `
+		SELECT token, block_number, tx_hash, log_index, from_addr, to_addr, value
+		FROM chain_transfers
+		ORDER BY block_number, log_index
+		LIMIT $1 OFFSET $2`,
+		limit, offset,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query chain transfers: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]chain.Transfer, 0, limit)
+	for rows.Next() {
+		var (
+			t   chain.Transfer
+			blk int64
+			idx int32
+		)
+		if err := rows.Scan(&t.Token, &blk, &t.TxHash, &idx, &t.From, &t.To, &t.Value); err != nil {
+			return nil, 0, fmt.Errorf("scan chain transfer: %w", err)
+		}
+		t.BlockNumber = uint64(blk)
+		t.LogIndex = uint(idx)
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate chain transfers: %w", err)
+	}
+	return out, total, nil
 }
 
 // Ping 供健康检查使用。

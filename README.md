@@ -2,8 +2,8 @@
 
 A limit order book matching engine written in Go, implementing price-time priority with partial fills and a concurrency-safe order book.
 
-Standard library for everything except the PostgreSQL driver (`pgx`) and the
-WebSocket upgrade (`gorilla/websocket`).
+Standard library for everything except the PostgreSQL driver (`pgx`), the
+WebSocket upgrade (`gorilla/websocket`), and the chain client (`go-ethereum`).
 
 ## Tutorial
 
@@ -74,7 +74,8 @@ the hostname is random and changes on every reconnect.
 - **Paginated trade history** — `/trades?limit=&offset=` returns a window plus the total count, with a hard cap of 1000 per page so one request cannot copy the entire log
 - **Real-time feed** — a WebSocket at `/ws` pushes a depth snapshot on connect, then every trade and book change as it happens; slow clients are dropped rather than allowed to block matching
 - **Durable** — every order and cancellation is appended to a PostgreSQL event log before it is applied; on startup the log is replayed to rebuild the book and trade history
-- **Full test suite** — 43 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, WebSocket fan-out, and the HTTP layer
+- **On-chain transfer feed** — an optional watcher polls an ERC20 contract's `Transfer` events, stores them idempotently in PostgreSQL behind a confirmation window, and serves them from `/transfers`
+- **Full test suite** — 53 tests covering matching, priority, cancellation, status, book invariants, concurrency, recovery, paging, WebSocket fan-out, the HTTP layer, and the chain watcher (decoding, confirmations, cursor resume, batching, retry)
 
 ## Quick Start
 
@@ -101,6 +102,26 @@ DATABASE_URL="postgres://$USER@127.0.0.1:5432/matching?sslmode=disable" \
 ```
 
 Without `DATABASE_URL` the service runs in memory only and logs a warning — handy for a quick look, wrong for anything real.
+
+To also follow an ERC20 contract, provide a node URL and the token address. Both are required; omit either and the watcher stays off:
+
+```bash
+DATABASE_URL="postgres://$USER@127.0.0.1:5432/matching?sslmode=disable" \
+CHAIN_RPC_URL="https://ethereum-rpc.publicnode.com" \
+ERC20_CONTRACT="0xdAC17F958D2ee523a2206206994597C13D831ec7" \
+  go run ./cmd/api
+# chain watcher following 0xdAC1...31ec7
+# matching-engine API listening on http://localhost:8080
+```
+
+```bash
+curl 'localhost:8080/transfers?limit=2'
+# {"transfers":[{"token":"0xdac1...","block_number":21234567,"tx_hash":"0x...",
+#   "log_index":12,"from":"0x...","to":"0x...","value":"1000000000000000000"}],
+#  "total":84213,"limit":2,"offset":0}
+```
+
+`value` is a **decimal string**, not a JSON number: on-chain amounts are 256-bit integers, and a JSON number in most languages lands in `float64`, which silently loses precision above 2^53.
 
 Demo output:
 
@@ -243,6 +264,7 @@ The `api` package is a thin protocol layer over `engine`: it decodes JSON, valid
 | `DELETE` | `/orders/{id}` | Cancel a resting order; `404` if it is unknown or already filled |
 | `GET` | `/depth?n=5` | Top-*n* market depth for both sides |
 | `GET` | `/trades?limit=&offset=` | Paginated trade history (default 100, max 1000), oldest first |
+| `GET` | `/transfers?limit=&offset=` | Paginated ERC20 transfers observed on chain; `503` when the watcher is not configured |
 | `GET` | `/ws` | WebSocket stream: depth snapshot on connect, then every trade and book change |
 | `GET` | `/healthz` | Liveness probe for load balancers / container checks |
 
@@ -399,6 +421,52 @@ Why replay instead of a second trades table:
 
 Known limits, stated on purpose: startup replay is O(n) and fine only while the log is small; the trade history and order-status map live in memory and grow with the log (a real deployment would page them from PostgreSQL); prices are `DOUBLE PRECISION` because the engine is `float64` (a production exchange would use fixed-point); and a single API replica owns the book, since matching is in-memory.
 
+## On-chain Transfers
+
+An optional module (`chain`) follows one ERC20 contract and records its `Transfer` events. It is deliberately separate from the matching path: on-chain data is *observed*, not replayed, so it cannot affect the order book.
+
+```
+       chain node                         postgres
+           │                                 │
+  BlockNumber ──► safe = head - 12            │
+           │                                 │
+  FilterLogs(addr, Transfer, next..to)       │
+           │                                 │
+           ▼                                 │
+   DecodeTransfer (topics + data) ──► SaveTransfers ──► chain_transfers
+                                          └────────────► chain_cursor
+                                                          (last_block)
+```
+
+```sql
+CREATE TABLE chain_transfers (
+    id BIGSERIAL PRIMARY KEY,
+    token        TEXT    NOT NULL,
+    block_number BIGINT  NOT NULL CHECK (block_number > 0),
+    tx_hash      TEXT    NOT NULL,
+    log_index    INT     NOT NULL,
+    from_addr    TEXT    NOT NULL,
+    to_addr      TEXT    NOT NULL,
+    value        TEXT    NOT NULL,           -- decimal string, 256-bit safe
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tx_hash, log_index)              -- the idempotency key
+);
+
+CREATE TABLE chain_cursor (id SMALLINT PRIMARY KEY CHECK (id = 1), last_block BIGINT NOT NULL);
+```
+
+Why this shape:
+
+- **Polling, not subscriptions.** `FilterLogs` works over plain HTTPS while `SubscribeFilterLogs` needs `wss`, which many providers do not expose. Polling also has no gap to backfill after a dropped connection, and a crash resumes from the cursor in the database. The cost is a few seconds of latency, which is irrelevant for a ledger. WebSocket subscriptions are the right answer only when sub-second latency matters, and they require a gap-recovery path.
+- **12-block confirmation window.** Only blocks at or below `head - 12` are processed, so a short reorg cannot insert a transfer that later disappears. The window is configurable; `Confirmations: 1` means "trust the tip".
+- **One transaction per batch.** Transfers and the cursor advance commit together. If the write fails, the cursor does not move, and the next poll retries the same range.
+- **`ON CONFLICT (tx_hash, log_index) DO NOTHING`.** A retry after a partial failure re-inserts nothing and advances the cursor. Without it, a crash between insert and cursor update would duplicate rows.
+- **Topic decoding.** `Transfer(address,address,uint256)` is identified by `keccak256` of the signature in `topics[0]`; `from` and `to` are indexed and live in `topics[1]` and `topics[2]`; the amount is the 32-byte `data` payload, read as `big.Int` and stored as a decimal string.
+- **The bookmark is the block, not the log.** If a batch produces zero transfers, the cursor still advances — otherwise every subsequent poll rescans the same empty range.
+- **Bounded batches.** At most 2000 blocks are requested per poll, so a first run against a long backfill does not ask a node for millions of blocks at once.
+
+Failure handling follows the same principle as the order path: a failed poll is retried with exponential backoff (1s → 30s, reset on success) rather than terminating the watcher. Nothing is applied before it is durable.
+
 ## Design Notes
 
 **Why a slice *and* a map?**
@@ -427,8 +495,9 @@ A level that is fully consumed but left in the book would keep answering `BestBi
 | Both sides | sell orders crossing resting bids |
 | Snapshot | depth truncation, `Depth(0)`, volume positivity |
 | Concurrency | 100 goroutines submitting simultaneously, verified with `-race` |
-| HTTP layer | service index, order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method |
+| HTTP layer | service index, order submission, JSON shape, input validation (malformed body, bad side, zero price, negative size), depth parameter validation, trade paging (window, total, out-of-range offset, limit cap), 405 on wrong method, transfers paging and the `503` when the chain module is absent |
 | WebSocket | hub fan-out to multiple subscribers, unsubscribe closing the channel, idempotent cancel, end-to-end stream (snapshot on connect, trade then depth after a fill) |
+| Chain watcher | Transfer log decoding (valid and foreign events), confirmation window, cursor resume, empty batches still advancing, batch splitting, retry after a source error |
 
 ```bash
 go test ./... -race
